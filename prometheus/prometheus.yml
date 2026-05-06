@@ -1,0 +1,35 @@
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+  external_labels:
+    monitor: pi-netmon
+
+scrape_configs:
+
+  # Prometheus self-scrape
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # ---- DrayTek 2765ax via SNMP --------------------------------------------
+  # snmp_exporter is asked to query the router using the if_mib module
+  # (standard interface counters: ifInOctets, ifOutOctets, ifSpeed, etc).
+  - job_name: snmp-draytek
+    scrape_interval: 30s
+    static_configs:
+      - targets:
+          - 192.168.1.1            # EDIT: DrayTek LAN IP
+        labels:
+          device: draytek-2765ax
+    metrics_path: /snmp
+    params:
+      module: [if_mib]
+      auth: [public_v2]            # snmp_exporter default auth -- community = "public"
+                                   # EDIT snmp.yml if you change the community string
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: snmp-exporter:9116

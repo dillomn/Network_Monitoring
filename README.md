@@ -41,11 +41,12 @@ This is the single most important step. Without it, ntopng will only see traffic
 1. Web UI → **LAN → LAN Port Mirror**
 2. Configure:
    - **Mirror Port**: the LAN port the Pi is plugged into (e.g. `P1`)
-   - **Mirrored Port(s)**: tick every other LAN port you want to watch (`P2`, `P3`, `P4`, and the WAN if you want to see WAN-side traffic too)
+   - **Mirrored Port(s)**: tick every *other* LAN port you want to watch (`P2`, `P3`, `P4`)
    - **Mirrored Direction**: **Both** (TX + RX)
+   - **Do NOT tick WAN1.** The DrayTek warns that WAN1 mirroring is done in software and degrades router performance. You don't need it: every byte a LAN device sends to the internet passes through one of the LAN ports first, so ntopng will still see and attribute it. Mirroring WAN1 on a router that's already being saturated by the bad device will only make crashes more likely.
 3. Apply.
 
-After this, the Pi's `eth0` will receive a copy of every frame on the mirrored ports.
+After this, the Pi's `eth0` will receive a copy of every frame on the mirrored LAN ports.
 
 > **Heads-up:** the Pi loses general LAN connectivity through this port if your DrayTek model dedicates the mirror port to receive-only. On the 2765ax it should remain bidirectional, but if you can't reach the Pi over SSH after enabling, plug a USB-Ethernet adapter into the Pi and use that as a management interface (then change `-i=eth0` in `compose.yaml` to whichever interface receives the mirror traffic — usually still `eth0`).
 

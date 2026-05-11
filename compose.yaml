@@ -18,7 +18,10 @@ services:
 
   # ---------- ntopng: per-host traffic analysis (top talkers) -------------
   ntopng:
-    image: ntop/ntopng:stable
+    # ntop only publishes an ARM64 image under the "_arm64.dev" repo. It's
+    # the dev branch, but it's actively maintained and what runs on a Pi.
+    # Requires 64-bit PiOS (run `uname -m` -> should print `aarch64`).
+    image: ntop/ntopng_arm64.dev:latest
     container_name: ntopng
     restart: unless-stopped
     network_mode: host          # needed to capture from the host's NIC

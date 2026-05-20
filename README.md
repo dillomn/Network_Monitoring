@@ -10,7 +10,7 @@ A self-contained web app for the Raspberry Pi that polls a **DrayTek 2765ax** ro
 - Scrapes the **DHCP Table** for device identity (IP, MAC, hostname)
 - Scrapes the **Data Flow Monitor** for per-IP bandwidth (TX + RX)
 - Stores samples in a local SQLite database (default 30-day retention)
-- Serves a web UI at `http://<pi-ip>:8080`:
+- Serves a web UI at `http://<pi-ip>:8090`:
   - Sortable device list with live TX/RX rates
   - Click any device → modal with a big graph, vendor lookup, notes
   - Filter by name / IP / MAC
@@ -48,7 +48,7 @@ docker compose logs -f draymon
 
 First image build takes ~3 minutes on a Pi 4. After that, container starts in seconds.
 
-Open <http://`pi-ip`:8080> in any browser.
+Open <http://`pi-ip`:8090> in any browser.
 
 ## .env reference
 
@@ -76,12 +76,12 @@ DrayTek's HTML layout varies by firmware version. The scraper tries a few known 
 
 ```bash
 # Raw HTML of what we tried to parse:
-curl http://<pi-ip>:8080/debug/raw?page=dhcp
-curl http://<pi-ip>:8080/debug/raw?page=flow
+curl http://<pi-ip>:8090/debug/raw?page=dhcp
+curl http://<pi-ip>:8090/debug/raw?page=flow
 
 # What the parser made of it:
-curl http://<pi-ip>:8080/debug/parsed?page=dhcp
-curl http://<pi-ip>:8080/debug/parsed?page=flow
+curl http://<pi-ip>:8090/debug/parsed?page=dhcp
+curl http://<pi-ip>:8090/debug/parsed?page=flow
 ```
 
 If `/debug/raw` returns 404 ("no candidate URL responded"), the router's page is at a different path on your firmware. Find the real URL by browsing the DrayTek web UI with your browser's dev tools open (Network tab), then add it to `DHCP_PATHS` or `FLOW_PATHS` in [app/draytek.py](app/draytek.py).

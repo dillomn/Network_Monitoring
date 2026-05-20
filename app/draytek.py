@@ -169,58 +169,101 @@ class DraytekClient:
         return False
 
     async def discover_api(self) -> dict:
-        """Authenticate, then walk the Angular SPA's JS bundles looking for
-        `/cgi-bin/v2/...` references. Probes each unique endpoint and reports
-        what it returns. Use this to find the right DHCP + Data Flow paths
-        on a firmware whose endpoints we don't yet know."""
+        """Authenticate, fetch every plausible dashboard URL + JS bundle,
+        grep everything for `/cgi-bin/v2/...` references, and probe each
+        candidate. Also probes a hardcoded list of known DrayTek endpoints
+        in case discovery turns up nothing."""
         if not await self.login():
             return {"error": "login failed"}
         c = await self._ensure_client()
 
-        try:
-            spa = await c.get("/")
-        except Exception as e:
-            return {"error": f"could not GET / : {e}"}
+        pages_to_try = [
+            "/", "/main.html", "/index.html", "/home.html",
+            "/weblogin.htm", "/dashboard.html", "/wizard.htm",
+        ]
+        pages_seen: list[dict] = []
+        all_text: list[str] = []
+        js_urls: set[str] = set()
 
-        js_urls = re.findall(r'(?:src|href)=["\']([^"\']+\.js(?:\?[^"\']*)?)["\']', spa.text)
-        js_urls = list(dict.fromkeys(js_urls))
+        for page in pages_to_try:
+            try:
+                r = await c.get(page)
+                pages_seen.append({
+                    "path": page,
+                    "status": r.status_code,
+                    "final_url": str(r.url),
+                    "body_len": len(r.text),
+                })
+                if r.status_code == 200 and r.text:
+                    all_text.append(r.text)
+                    for m in re.findall(r"""['"](/[^'"\s<>]+\.js(?:\?[^'"\s<>]*)?)['"]""", r.text):
+                        js_urls.add(m)
+            except Exception as e:
+                pages_seen.append({"path": page, "error": str(e)})
 
-        found: set[str] = set()
-        scanned: list[str] = []
-        for url in js_urls[:25]:
+        scanned_js: list[dict] = []
+        for url in list(js_urls)[:40]:
             try:
                 r = await c.get(url)
+                if r.status_code == 200 and r.text:
+                    all_text.append(r.text)
+                    scanned_js.append({"path": url, "body_len": len(r.text)})
             except Exception:
                 continue
-            if r.status_code != 200:
-                continue
-            scanned.append(url)
-            for m in re.findall(r"/cgi-bin/v2/[A-Za-z0-9_./\-]+", r.text):
+
+        found: set[str] = set()
+        for text in all_text:
+            for m in re.findall(r"/cgi-bin/v2/[A-Za-z0-9_./\-]+", text):
                 found.add(m.rstrip("./"))
 
-        probes = []
-        for path in sorted(found):
-            try:
-                r = await c.get(path)
-                ct = r.headers.get("content-type", "")
-                snippet = r.text[:300]
-                probes.append({
-                    "path": path,
-                    "method": "GET",
-                    "status": r.status_code,
-                    "content_type": ct,
-                    "body_len": len(r.text),
-                    "is_json": "json" in ct.lower() or snippet.lstrip().startswith(("{", "[")),
-                    "body_head": snippet,
-                })
-            except Exception as e:
-                probes.append({"path": path, "error": str(e)})
+        # Brute-force candidates so we get useful output even if discovery
+        # finds nothing referenced in the JS bundles.
+        BRUTE_CANDIDATES = [
+            "/cgi-bin/v2/dhcptable", "/cgi-bin/v2/dhcpTable",
+            "/cgi-bin/v2/get_dhcp_table.cgi", "/cgi-bin/v2/get_dhcp_status.cgi",
+            "/cgi-bin/v2/get_lan_status.cgi", "/cgi-bin/v2/get_lan_clients.cgi",
+            "/cgi-bin/v2/get_arp_table.cgi", "/cgi-bin/v2/arpTable",
+            "/cgi-bin/v2/dataflow", "/cgi-bin/v2/dataFlowMonitor",
+            "/cgi-bin/v2/get_data_flow.cgi", "/cgi-bin/v2/get_traffic.cgi",
+            "/cgi-bin/v2/get_bandwidth.cgi", "/cgi-bin/v2/get_online_users.cgi",
+            "/cgi-bin/v2/online_users.cgi", "/cgi-bin/v2/get_session_info.cgi",
+            "/cgi-bin/v2/getStatus.cgi", "/cgi-bin/v2/sessions",
+            "/cgi-bin/v2/dhcpTable.cgi", "/cgi-bin/v2/dataFlowMonitor.cgi",
+            "/cgi-bin/v2/lan_dhcp.cgi", "/cgi-bin/v2/get_clients.cgi",
+        ]
+        candidates = found | set(BRUTE_CANDIDATES)
+
+        probes: list[dict] = []
+        for path in sorted(candidates):
+            for method in ("GET", "POST"):
+                try:
+                    r = await (c.get(path) if method == "GET" else c.post(path, json={}))
+                    snippet = r.text[:400]
+                    ct = r.headers.get("content-type", "")
+                    is_json = "json" in ct.lower() or snippet.lstrip().startswith(("{", "["))
+                    probes.append({
+                        "path": path,
+                        "method": method,
+                        "status": r.status_code,
+                        "content_type": ct,
+                        "body_len": len(r.text),
+                        "is_json": is_json,
+                        "looks_interesting": is_json and r.status_code == 200,
+                        "body_head": snippet,
+                    })
+                    if method == "GET" and r.status_code == 200 and is_json:
+                        break  # GET worked, no need to try POST
+                except Exception as e:
+                    probes.append({"path": path, "method": method, "error": str(e)})
 
         return {
-            "spa_js_urls": js_urls,
-            "scanned_js": scanned,
-            "api_paths_found": sorted(found),
+            "pages_seen": pages_seen,
+            "js_urls_found": sorted(js_urls),
+            "scanned_js": scanned_js,
+            "api_paths_from_js": sorted(found),
+            "probed_paths": sorted(candidates),
             "probes": probes,
+            "interesting": [p for p in probes if p.get("looks_interesting")],
         }
 
     async def login(self) -> bool:

@@ -153,8 +153,12 @@ class DraytekClient:
             self._client = None
 
     async def _probe_authenticated(self, client: httpx.AsyncClient) -> bool:
-        """Hit a protected page and decide whether we got real content or
-        got bounced back to the login form."""
+        """Authenticated if we hold a router session cookie, OR if a
+        protected page returns real content rather than the login form."""
+        for name in client.cookies.keys():
+            n = name.lower()
+            if "session" in n or "vigor" in n:
+                return True
         for path in DHCP_PATHS + FLOW_PATHS:
             try:
                 r = await client.get(path)
@@ -163,6 +167,61 @@ class DraytekClient:
             if r.status_code == 200 and _looks_authenticated(r.text):
                 return True
         return False
+
+    async def discover_api(self) -> dict:
+        """Authenticate, then walk the Angular SPA's JS bundles looking for
+        `/cgi-bin/v2/...` references. Probes each unique endpoint and reports
+        what it returns. Use this to find the right DHCP + Data Flow paths
+        on a firmware whose endpoints we don't yet know."""
+        if not await self.login():
+            return {"error": "login failed"}
+        c = await self._ensure_client()
+
+        try:
+            spa = await c.get("/")
+        except Exception as e:
+            return {"error": f"could not GET / : {e}"}
+
+        js_urls = re.findall(r'(?:src|href)=["\']([^"\']+\.js(?:\?[^"\']*)?)["\']', spa.text)
+        js_urls = list(dict.fromkeys(js_urls))
+
+        found: set[str] = set()
+        scanned: list[str] = []
+        for url in js_urls[:25]:
+            try:
+                r = await c.get(url)
+            except Exception:
+                continue
+            if r.status_code != 200:
+                continue
+            scanned.append(url)
+            for m in re.findall(r"/cgi-bin/v2/[A-Za-z0-9_./\-]+", r.text):
+                found.add(m.rstrip("./"))
+
+        probes = []
+        for path in sorted(found):
+            try:
+                r = await c.get(path)
+                ct = r.headers.get("content-type", "")
+                snippet = r.text[:300]
+                probes.append({
+                    "path": path,
+                    "method": "GET",
+                    "status": r.status_code,
+                    "content_type": ct,
+                    "body_len": len(r.text),
+                    "is_json": "json" in ct.lower() or snippet.lstrip().startswith(("{", "[")),
+                    "body_head": snippet,
+                })
+            except Exception as e:
+                probes.append({"path": path, "error": str(e)})
+
+        return {
+            "spa_js_urls": js_urls,
+            "scanned_js": scanned,
+            "api_paths_found": sorted(found),
+            "probes": probes,
+        }
 
     async def login(self) -> bool:
         """Try multiple auth strategies. Returns True if any sticks.

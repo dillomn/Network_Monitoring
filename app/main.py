@@ -81,6 +81,17 @@ async def set_note(mac: str, body: NoteIn) -> dict:
 
 # ------- Debug endpoints (use to tune scraping against your firmware) -------
 
+@app.get("/debug/discover")
+async def debug_discover() -> JSONResponse:
+    """Authenticate against the router, then walk the SPA's JS bundles to
+    find candidate JSON API endpoints (DHCP table, Data Flow, etc.)."""
+    client = DraytekClient()
+    try:
+        return JSONResponse(await client.discover_api())
+    finally:
+        await client.close()
+
+
 @app.get("/debug/login")
 async def debug_login() -> JSONResponse:
     """Returns what every login strategy sent and what the router responded

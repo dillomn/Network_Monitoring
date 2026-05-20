@@ -1,105 +1,17 @@
-name: netmon
-
-# ----------------------------------------------------------------------------
-# Network monitoring stack for Raspberry Pi 4 (PiOS 64-bit).
-#
-# Two layers of visibility:
-#   1. ntopng (+ redis)  -> packet-level analysis. REQUIRES the DrayTek to
-#      mirror LAN traffic to the Pi's ethernet port. Without a mirror the
-#      Pi will only see its own traffic + broadcasts.
-#   2. Prometheus + snmp_exporter + Grafana -> SNMP polling of the DrayTek
-#      for WAN/LAN interface counters. Works without a mirror and gives
-#      long-term graphs.
-#
-# See README.md for DrayTek port-mirror + SNMP setup steps.
-# ----------------------------------------------------------------------------
+name: draymon
 
 services:
-
-  # ---------- ntopng: per-host traffic analysis (top talkers) -------------
-  ntopng:
-    # ntop only publishes an ARM64 image under the "_arm64.dev" repo. It's
-    # the dev branch, but it's actively maintained and what runs on a Pi.
-    # Requires 64-bit PiOS (run `uname -m` -> should print `aarch64`).
-    image: ntop/ntopng_arm64.dev:latest
-    container_name: ntopng
-    restart: unless-stopped
-    network_mode: host          # needed to capture from the host's NIC
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
-    depends_on:
-      - redis
-    volumes:
-      - ntopng_data:/var/lib/ntopng
-    # EDIT: -i is the capture interface (eth0 on a Pi 4).
-    # EDIT: -m is the local network(s) in CIDR. Add more comma-separated.
-    # -w 3000 is the web UI port. --community runs the free edition.
-    command: >
-      --community
-      -i=eth0
-      -m=192.168.1.0/24
-      -r=127.0.0.1:6379
-      -d=/var/lib/ntopng
-      -w=3000
-      -e
-
-  redis:
-    image: redis:7-alpine
-    container_name: ntopng-redis
-    restart: unless-stopped
-    network_mode: host          # share host net so ntopng can reach it on 127.0.0.1
-    volumes:
-      - redis_data:/data
-    command: ["redis-server", "--bind", "127.0.0.1", "--save", "60", "1"]
-
-  # ---------- SNMP polling of the DrayTek 2765ax --------------------------
-  snmp-exporter:
-    image: prom/snmp-exporter:latest
-    container_name: snmp-exporter
+  draymon:
+    build: .
+    container_name: draymon
     restart: unless-stopped
     ports:
-      - "9116:9116"
-    # Uses the bundled default snmp.yml (includes the if_mib module which is
-    # all we need for interface counters). To customize, mount your own:
-    #   volumes:
-    #     - ./snmp-exporter/snmp.yml:/etc/snmp_exporter/snmp.yml:ro
-
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: prometheus
-    restart: unless-stopped
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus_data:/prometheus
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.path=/prometheus"
-      - "--storage.tsdb.retention.time=90d"
-      - "--web.enable-lifecycle"
-    depends_on:
-      - snmp-exporter
-
-  grafana:
-    image: grafana/grafana:latest
-    container_name: grafana
-    restart: unless-stopped
-    ports:
-      - "3001:3000"             # Pi:3001 -> Grafana (ntopng owns 3000)
+      - "8080:8080"
+    env_file: .env
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin   # EDIT: change on first login
-      - GF_USERS_ALLOW_SIGN_UP=false
+      - DB_PATH=/data/netmon.db
     volumes:
-      - grafana_data:/var/lib/grafana
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
-    depends_on:
-      - prometheus
+      - draymon_data:/data
 
 volumes:
-  ntopng_data:
-  redis_data:
-  prometheus_data:
-  grafana_data:
+  draymon_data:

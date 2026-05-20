@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>DrayTek Network Monitor</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>DrayTek Network Monitor</h1>
+    <div id="health" class="health">connecting…</div>
+  </header>
+
+  <main>
+    <section class="panel devices">
+      <div class="panel-head">
+        <h2>Devices</h2>
+        <input id="filter" placeholder="filter by name / IP / MAC" />
+      </div>
+      <table id="device-table">
+        <thead>
+          <tr>
+            <th>Device</th>
+            <th>IP</th>
+            <th>MAC</th>
+            <th class="num">TX</th>
+            <th class="num">RX</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section class="panel chart-panel">
+      <div class="panel-head">
+        <h2 id="chart-title">Top talkers — last hour</h2>
+        <select id="range">
+          <option value="1">1 hour</option>
+          <option value="6">6 hours</option>
+          <option value="24" selected>24 hours</option>
+          <option value="168">7 days</option>
+          <option value="720">30 days</option>
+        </select>
+      </div>
+      <div class="chart-wrap"><canvas id="main-chart"></canvas></div>
+    </section>
+  </main>
+
+  <div id="modal" class="modal hidden">
+    <div class="modal-card">
+      <button class="close" id="modal-close" aria-label="Close">&times;</button>
+      <header class="modal-head">
+        <div>
+          <h2 id="m-name">—</h2>
+          <div class="meta">
+            <span id="m-ip"></span>
+            <span id="m-mac"></span>
+            <span id="m-vendor"></span>
+          </div>
+        </div>
+        <div class="totals">
+          <div><span class="lbl">TX now</span><span id="m-tx">—</span></div>
+          <div><span class="lbl">RX now</span><span id="m-rx">—</span></div>
+          <div><span class="lbl">First seen</span><span id="m-first">—</span></div>
+          <div><span class="lbl">Last seen</span><span id="m-last">—</span></div>
+        </div>
+      </header>
+      <div class="modal-controls">
+        <label>Window:
+          <select id="m-range">
+            <option value="1">1 hour</option>
+            <option value="6">6 hours</option>
+            <option value="24" selected>24 hours</option>
+            <option value="168">7 days</option>
+            <option value="720">30 days</option>
+          </select>
+        </label>
+        <label>Note:
+          <input id="m-note" placeholder="e.g. living room TV" />
+          <button id="m-save-note">Save</button>
+        </label>
+      </div>
+      <div class="chart-wrap big"><canvas id="m-chart"></canvas></div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

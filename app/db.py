@@ -1,0 +1,110 @@
+import sqlite3
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+from .config import settings
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS devices (
+    mac TEXT PRIMARY KEY,
+    ip TEXT,
+    hostname TEXT,
+    vendor TEXT,
+    notes TEXT,
+    first_seen INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mac TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    tx_bps REAL NOT NULL,
+    rx_bps REAL NOT NULL,
+    sessions INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_samples_mac_ts ON samples(mac, ts);
+CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(ts);
+"""
+
+
+def init_db() -> None:
+    Path(settings.db_path).parent.mkdir(parents=True, exist_ok=True)
+    with conn() as c:
+        c.executescript(SCHEMA)
+
+
+@contextmanager
+def conn():
+    c = sqlite3.connect(settings.db_path)
+    c.row_factory = sqlite3.Row
+    try:
+        yield c
+        c.commit()
+    finally:
+        c.close()
+
+
+def upsert_device(mac: str, ip: str, hostname: str | None, vendor: str | None = None) -> None:
+    now = int(time.time())
+    with conn() as c:
+        c.execute(
+            """
+            INSERT INTO devices (mac, ip, hostname, vendor, first_seen, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(mac) DO UPDATE SET
+                ip=excluded.ip,
+                hostname=COALESCE(excluded.hostname, devices.hostname),
+                vendor=COALESCE(excluded.vendor, devices.vendor),
+                last_seen=excluded.last_seen
+            """,
+            (mac, ip, hostname, vendor, now, now),
+        )
+
+
+def insert_sample(mac: str, tx_bps: float, rx_bps: float, sessions: int | None = None) -> None:
+    with conn() as c:
+        c.execute(
+            "INSERT INTO samples (mac, ts, tx_bps, rx_bps, sessions) VALUES (?, ?, ?, ?, ?)",
+            (mac, int(time.time()), tx_bps, rx_bps, sessions),
+        )
+
+
+def list_devices_with_current() -> list[dict]:
+    with conn() as c:
+        rows = c.execute(
+            """
+            SELECT d.mac, d.ip, d.hostname, d.vendor, d.notes,
+                   d.first_seen, d.last_seen,
+                   (SELECT tx_bps FROM samples s WHERE s.mac = d.mac ORDER BY ts DESC LIMIT 1) AS tx_bps,
+                   (SELECT rx_bps FROM samples s WHERE s.mac = d.mac ORDER BY ts DESC LIMIT 1) AS rx_bps,
+                   (SELECT ts     FROM samples s WHERE s.mac = d.mac ORDER BY ts DESC LIMIT 1) AS last_sample
+            FROM devices d
+            ORDER BY (tx_bps + rx_bps) DESC NULLS LAST, d.hostname
+            """
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def history_for(mac: str, since_ts: int) -> list[dict]:
+    with conn() as c:
+        rows = c.execute(
+            "SELECT ts, tx_bps, rx_bps, sessions FROM samples WHERE mac = ? AND ts >= ? ORDER BY ts ASC",
+            (mac, since_ts),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def prune_old_samples(retention_days: int) -> int:
+    cutoff = int(time.time()) - retention_days * 86400
+    with conn() as c:
+        cur = c.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
+        return cur.rowcount
+
+
+def set_device_note(mac: str, note: str) -> None:
+    with conn() as c:
+        c.execute("UPDATE devices SET notes = ? WHERE mac = ?", (note, mac))

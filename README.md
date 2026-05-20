@@ -120,7 +120,7 @@ Data lives in the `draymon_data` Docker volume (`docker volume inspect draymon_d
 +----------+-------------+
 | Pi 4 — Docker container|
 |  +------------------+  |
-|  | FastAPI + uvicorn|  |  port 8080
+|  | FastAPI + uvicorn|  |  port 8090
 |  | +--------------+ |  |
 |  | | poller task  | |  |
 |  | | DraytekClient| |  |

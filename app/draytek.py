@@ -14,6 +14,7 @@ import base64
 import logging
 import re
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -98,17 +99,48 @@ def _to_bps(value: str, unit_hint: str = "") -> float:
 class DraytekClient:
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
+        self._discovered_base: str | None = None
+
+    def _base(self) -> str:
+        return self._discovered_base or settings.router_base_url
 
     def _new_client(self, *, basic_auth: bool = False) -> httpx.AsyncClient:
         auth = (settings.router_user, settings.router_password) if basic_auth else None
         return httpx.AsyncClient(
-            base_url=settings.router_base_url,
+            base_url=self._base(),
             verify=settings.router_verify_ssl,
             timeout=15.0,
             follow_redirects=True,
             headers={"User-Agent": "Mozilla/5.0 (DraytekMonitor)"},
             auth=auth,
         )
+
+    async def _discover_base(self) -> None:
+        """Many DrayTek units force HTTPS on a non-standard port (e.g.
+        :4441). A naive POST to http://router/cgi-bin/wlogin.cgi gets
+        redirected and loses its form body. So we follow GET / once to
+        learn the real management URL and use that for everything."""
+        if self._discovered_base:
+            return
+        async with httpx.AsyncClient(
+            base_url=settings.router_base_url,
+            verify=settings.router_verify_ssl,
+            timeout=10.0,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (DraytekMonitor)"},
+        ) as probe:
+            try:
+                r = await probe.get("/")
+            except Exception as e:
+                log.warning("Management URL discovery failed: %s", e)
+                return
+            u = urlparse(str(r.url))
+            if not u.netloc:
+                return
+            discovered = f"{u.scheme}://{u.netloc}"
+            if discovered.rstrip("/") != settings.router_base_url.rstrip("/"):
+                log.info("Discovered management URL: %s -> %s", settings.router_base_url, discovered)
+                self._discovered_base = discovered
 
     async def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -137,6 +169,7 @@ class DraytekClient:
         If logged in, self._client is left in an authenticated state.
         """
         await self.close()  # discard any half-state from prior attempts
+        await self._discover_base()
 
         # Strategy 1: HTTP Basic Auth (DrayTek's CGI pages accept it on many builds)
         c = self._new_client(basic_auth=True)
@@ -175,8 +208,11 @@ class DraytekClient:
         """Run every strategy independently and report what the router said.
         Used by the /debug/login endpoint to help adjust the auth flow to
         a specific firmware build."""
+        await self._discover_base()
         diag: dict = {
-            "base_url": settings.router_base_url,
+            "configured_base_url": settings.router_base_url,
+            "discovered_base_url": self._discovered_base,
+            "effective_base_url": self._base(),
             "user": settings.router_user,
             "strategies": [],
         }

@@ -81,6 +81,18 @@ async def set_note(mac: str, body: NoteIn) -> dict:
 
 # ------- Debug endpoints (use to tune scraping against your firmware) -------
 
+@app.get("/debug/login")
+async def debug_login() -> JSONResponse:
+    """Returns what every login strategy sent and what the router responded
+    with. Use this when 'Router login failed' shows up — paste the output
+    so we can match the auth flow to your specific firmware."""
+    client = DraytekClient()
+    try:
+        return JSONResponse(await client.diagnose_login())
+    finally:
+        await client.close()
+
+
 @app.get("/debug/raw", response_class=PlainTextResponse)
 async def debug_raw(page: str = Query("flow", pattern="^(flow|dhcp)$")) -> str:
     """Returns the raw HTML the scraper fetched. Use this when devices or

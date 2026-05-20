@@ -38,7 +38,16 @@ FLOW_PATHS = [
     "/doc/dataflow.sht",
 ]
 
-LOGIN_PATH = "/cgi-bin/wlogin.cgi"
+LOGIN_PATHS = [
+    "/cgi-bin/wlogin.cgi",
+    "/cgi-bin/wlogin1.cgi",
+    "/weblogin.htm",
+]
+
+LOGIN_FORM_MARKERS = (
+    'name="aa"', 'name="ab"', 'name="username"', "wlogin",
+    "login.htm", "vigor login", "operation timeout", "session timeout",
+)
 
 
 @dataclass
@@ -90,15 +99,20 @@ class DraytekClient:
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
 
+    def _new_client(self, *, basic_auth: bool = False) -> httpx.AsyncClient:
+        auth = (settings.router_user, settings.router_password) if basic_auth else None
+        return httpx.AsyncClient(
+            base_url=settings.router_base_url,
+            verify=settings.router_verify_ssl,
+            timeout=15.0,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (DraytekMonitor)"},
+            auth=auth,
+        )
+
     async def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(
-                base_url=settings.router_base_url,
-                verify=settings.router_verify_ssl,
-                timeout=15.0,
-                follow_redirects=True,
-                headers={"User-Agent": "Mozilla/5.0 (DraytekMonitor)"},
-            )
+            self._client = self._new_client()
         return self._client
 
     async def close(self) -> None:
@@ -106,39 +120,142 @@ class DraytekClient:
             await self._client.aclose()
             self._client = None
 
-    async def login(self) -> bool:
-        """Best-effort login. DrayTek 2765 firmware accepts base64-encoded
-        creds in the `aa`/`ab` fields of /cgi-bin/wlogin.cgi.
-        """
-        client = await self._ensure_client()
-        try:
-            await client.get("/")  # prime cookies / CSRF tokens
-        except Exception as e:
-            log.warning("Could not reach router root: %s", e)
-            return False
+    async def _probe_authenticated(self, client: httpx.AsyncClient) -> bool:
+        """Hit a protected page and decide whether we got real content or
+        got bounced back to the login form."""
+        for path in DHCP_PATHS + FLOW_PATHS:
+            try:
+                r = await client.get(path)
+            except Exception:
+                continue
+            if r.status_code == 200 and _looks_authenticated(r.text):
+                return True
+        return False
 
+    async def login(self) -> bool:
+        """Try multiple auth strategies. Returns True if any sticks.
+        If logged in, self._client is left in an authenticated state.
+        """
+        await self.close()  # discard any half-state from prior attempts
+
+        # Strategy 1: HTTP Basic Auth (DrayTek's CGI pages accept it on many builds)
+        c = self._new_client(basic_auth=True)
+        if await self._probe_authenticated(c):
+            log.info("Authenticated via HTTP Basic")
+            self._client = c
+            return True
+        await c.aclose()
+
+        # Strategy 2: classic form POST with base64'd creds (older firmware)
+        c = self._new_client(basic_auth=False)
         aa = base64.b64encode(settings.router_user.encode()).decode()
         ab = base64.b64encode(settings.router_password.encode()).decode()
-        try:
-            r = await client.post(
-                LOGIN_PATH,
-                data={"aa": aa, "ab": ab, "ja_name": settings.router_user, "ja_passwd": ""},
-            )
-        except Exception as e:
-            log.error("Login POST failed: %s", e)
-            return False
+        for path in LOGIN_PATHS:
+            try:
+                await c.get("/")  # prime any session cookie
+                r = await c.post(path, data={
+                    "aa": aa, "ab": ab,
+                    "ja_name": settings.router_user, "ja_passwd": "",
+                    "username": settings.router_user, "password": settings.router_password,
+                })
+                log.debug("Form POST %s -> %s", path, r.status_code)
+            except Exception as e:
+                log.debug("Form POST %s raised: %s", path, e)
+                continue
+            if await self._probe_authenticated(c):
+                log.info("Authenticated via form POST at %s", path)
+                self._client = c
+                return True
 
-        # Success indicators vary; treat 2xx without an obvious "login fail"
-        # marker as success. If you see persistent re-login storms, check
-        # the response body and tighten this check.
-        if r.status_code >= 400:
-            log.error("Login HTTP %s", r.status_code)
-            return False
-        body = r.text.lower()
-        if "password" in body and ("incorrect" in body or "invalid" in body):
-            log.error("Login rejected by router (bad password?)")
-            return False
-        return True
+        await c.aclose()
+        log.error("All login strategies failed. Hit /debug/login for diagnostics.")
+        return False
+
+    async def diagnose_login(self) -> dict:
+        """Run every strategy independently and report what the router said.
+        Used by the /debug/login endpoint to help adjust the auth flow to
+        a specific firmware build."""
+        diag: dict = {
+            "base_url": settings.router_base_url,
+            "user": settings.router_user,
+            "strategies": [],
+        }
+
+        # Basic Auth probe
+        c = self._new_client(basic_auth=True)
+        try:
+            for path in DHCP_PATHS:
+                try:
+                    r = await c.get(path)
+                    diag["strategies"].append({
+                        "name": "basic_auth",
+                        "url": path,
+                        "status": r.status_code,
+                        "body_len": len(r.text),
+                        "body_head": r.text[:400],
+                        "looks_authenticated": _looks_authenticated(r.text),
+                    })
+                    if r.status_code == 200 and _looks_authenticated(r.text):
+                        break
+                except Exception as e:
+                    diag["strategies"].append({"name": "basic_auth", "url": path, "error": str(e)})
+        finally:
+            await c.aclose()
+
+        # Form POST probes
+        for path in LOGIN_PATHS:
+            c = self._new_client(basic_auth=False)
+            try:
+                try:
+                    pre = await c.get("/")
+                    pre_status = pre.status_code
+                except Exception as e:
+                    pre_status = f"error: {e}"
+                aa = base64.b64encode(settings.router_user.encode()).decode()
+                ab = base64.b64encode(settings.router_password.encode()).decode()
+                try:
+                    r = await c.post(path, data={
+                        "aa": aa, "ab": ab,
+                        "ja_name": settings.router_user, "ja_passwd": "",
+                        "username": settings.router_user, "password": settings.router_password,
+                    })
+                    check = await c.get(DHCP_PATHS[0])
+                    diag["strategies"].append({
+                        "name": "form_post",
+                        "post_url": path,
+                        "pre_get_status": pre_status,
+                        "post_status": r.status_code,
+                        "post_body_head": r.text[:400],
+                        "cookies_after_post": list(c.cookies.keys()),
+                        "probe_url": DHCP_PATHS[0],
+                        "probe_status": check.status_code,
+                        "probe_body_head": check.text[:400],
+                        "looks_authenticated": _looks_authenticated(check.text),
+                    })
+                except Exception as e:
+                    diag["strategies"].append({"name": "form_post", "post_url": path, "error": str(e)})
+            finally:
+                await c.aclose()
+
+        # Login page HTML, so we can see what fields the form actually wants
+        c = self._new_client()
+        try:
+            for path in ("/", "/weblogin.htm", "/login.htm"):
+                try:
+                    r = await c.get(path)
+                    if r.status_code == 200 and len(r.text) > 200:
+                        diag["login_page_sample"] = {
+                            "url": path,
+                            "status": r.status_code,
+                            "body_head": r.text[:1500],
+                        }
+                        break
+                except Exception:
+                    continue
+        finally:
+            await c.aclose()
+
+        return diag
 
     async def _fetch_first(self, paths: list[str]) -> tuple[str, str] | None:
         """Try a list of candidate paths; return (path, html) for the first
@@ -173,6 +290,18 @@ class DraytekClient:
         if not html:
             return []
         return _parse_flow(html)
+
+
+def _looks_authenticated(html: str) -> bool:
+    """True if `html` looks like a real router page, not a login form.
+
+    DrayTek bounces unauthenticated requests back to the login page, which
+    we recognise via the markers in LOGIN_FORM_MARKERS.
+    """
+    if not html or len(html) < 200:
+        return False
+    lc = html.lower()
+    return not any(m in lc for m in LOGIN_FORM_MARKERS)
 
 
 def _normalise_mac(s: str) -> str:

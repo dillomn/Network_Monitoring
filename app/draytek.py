@@ -28,12 +28,17 @@ IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 NUM_RE = re.compile(r"[\d,.]+")
 
 DHCP_PATHS = [
-    "/doc/lan_dhcp.sht",
+    "/cgi-bin/dhcp.cgi",            # modern Vigor firmware (token required)
+    "/cgi-bin/ipdhcptbAdv.htm",
+    "/doc/lan_dhcp.sht",            # older firmware
     "/doc/dhcptable.sht",
     "/cgi-bin/v2/dhcptable",
 ]
 
 FLOW_PATHS = [
+    "/cgi-bin/dataflow.cgi",        # modern Vigor firmware (token required)
+    "/cgi-bin/dataFlowMonitor.cgi",
+    "/cgi-bin/datafm.cgi",
     "/doc/dataFlowM.sht",
     "/cgi-bin/v2/dataFlowMonitor",
     "/doc/dataflow.sht",
@@ -100,6 +105,7 @@ class DraytekClient:
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
         self._discovered_base: str | None = None
+        self._form_auth_token: str | None = None
 
     def _base(self) -> str:
         return self._discovered_base or settings.router_base_url
@@ -278,6 +284,7 @@ class DraytekClient:
         if await self._probe_authenticated(c):
             log.info("Authenticated via HTTP Basic")
             self._client = c
+            await self._refresh_form_auth_token()
             return True
         await c.aclose()
 
@@ -300,11 +307,17 @@ class DraytekClient:
             if await self._probe_authenticated(c):
                 log.info("Authenticated via form POST at %s", path)
                 self._client = c
+                await self._refresh_form_auth_token()
                 return True
 
         await c.aclose()
         log.error("All login strategies failed. Hit /debug/login for diagnostics.")
         return False
+
+    async def _ensure_form_token(self) -> None:
+        """Called from get_devices / get_flow before scraping."""
+        if not self._form_auth_token:
+            await self._refresh_form_auth_token()
 
     async def diagnose_login(self) -> dict:
         """Run every strategy independently and report what the router said.
@@ -395,25 +408,53 @@ class DraytekClient:
 
         return diag
 
-    async def _fetch_first(self, paths: list[str]) -> tuple[str, str] | None:
-        """Try a list of candidate paths; return (path, html) for the first
-        one that returns 200 with a non-trivial body."""
+    async def _refresh_form_auth_token(self) -> str | None:
+        """Modern Vigor firmware ties every data CGI to a per-session
+        `sFormAuthStr` token that's planted in the dashboard HTML. Find
+        and cache it so subsequent requests can pass it as a query arg."""
         client = await self._ensure_client()
-        for p in paths:
+        for page in ("/", "/main.html", "/index.html"):
             try:
-                r = await client.get(p)
-            except Exception as e:
-                log.debug("GET %s failed: %s", p, e)
+                r = await client.get(page)
+            except Exception:
                 continue
-            if r.status_code == 200 and len(r.text) > 200:
-                return p, r.text
+            if r.status_code != 200:
+                continue
+            m = re.search(r"sFormAuthStr=([A-Za-z0-9]+)", r.text)
+            if m:
+                self._form_auth_token = m.group(1)
+                log.info("Cached sFormAuthStr token from %s", page)
+                return self._form_auth_token
+        log.warning("Could not find sFormAuthStr in any dashboard page")
+        return None
+
+    async def _fetch_first(self, paths: list[str]) -> tuple[str, str] | None:
+        """Try each path; return (url, body) for the first 200 response
+        with non-trivial body. Automatically appends sFormAuthStr if a
+        token has been cached."""
+        client = await self._ensure_client()
+        token = self._form_auth_token
+        for p in paths:
+            url = p
+            if token and "sFormAuthStr" not in p:
+                sep = "&" if "?" in p else "?"
+                url = f"{p}{sep}sFormAuthStr={token}"
+            try:
+                r = await client.get(url)
+            except Exception as e:
+                log.debug("GET %s failed: %s", url, e)
+                continue
+            if r.status_code == 200 and len(r.text) > 200 and _looks_authenticated(r.text):
+                return url, r.text
         return None
 
     async def fetch_dhcp_html(self) -> str | None:
+        await self._ensure_form_token()
         got = await self._fetch_first(DHCP_PATHS)
         return got[1] if got else None
 
     async def fetch_flow_html(self) -> str | None:
+        await self._ensure_form_token()
         got = await self._fetch_first(FLOW_PATHS)
         return got[1] if got else None
 
@@ -451,7 +492,9 @@ def _parse_dhcp(html: str) -> list[Device]:
     """Pull (IP, MAC, hostname) triples out of a DrayTek DHCP page.
 
     Defensive: scans every table row, picks the cells that look like an IP
-    and a MAC, takes the remaining longest text cell as the hostname.
+    and a MAC, takes the remaining longest text cell as the hostname. If
+    no table rows are found (modern Vigor firmware uses a <pre>/text grid
+    rather than an HTML table), falls back to line-by-line text parsing.
     """
     soup = BeautifulSoup(html, "lxml")
     out: dict[str, Device] = {}
@@ -464,14 +507,46 @@ def _parse_dhcp(html: str) -> list[Device]:
         if not ip or not mac_cell:
             continue
         mac = _normalise_mac(MAC_RE.search(mac_cell).group(0))
-        # hostname = longest remaining textual cell that isn't ip/mac/numeric/expiry
         candidates = [c for c in cells if c not in (ip, mac_cell) and not IP_RE.fullmatch(c) and not MAC_RE.search(c)]
         candidates = [c for c in candidates if c and not c.replace(":", "").replace(" ", "").isdigit()]
         hostname = max(candidates, key=len) if candidates else None
         if hostname and hostname.lower() in {"---", "n/a", "unknown"}:
             hostname = None
         out[mac] = Device(mac=mac, ip=ip, hostname=hostname)
+
+    if not out:
+        out = _parse_dhcp_text(html)
     return list(out.values())
+
+
+def _parse_dhcp_text(html: str) -> dict[str, Device]:
+    """Fallback parser for text-grid DHCP pages like the Vigor 2765's
+    `dhcp.cgi`. Each line that contains both an IP and a MAC is treated
+    as a device; the remaining longest token on the line becomes the
+    hostname (stripping the index, leased-time, and other numerics)."""
+    text = re.sub(r"<[^>]+>", " ", html)
+    out: dict[str, Device] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        ip_m = IP_RE.search(line)
+        mac_m = MAC_RE.search(line)
+        if not ip_m or not mac_m:
+            continue
+        ip = ip_m.group(0)
+        mac = _normalise_mac(mac_m.group(0))
+        rest = line.replace(ip_m.group(0), " ").replace(mac_m.group(0), " ")
+        rest = re.sub(r"\b\d{1,3}:\d{2}:\d{2}\b", " ", rest)        # leased time HH:MM:SS
+        rest = re.sub(r"\b\d+\b", " ", rest)                          # standalone numbers (index)
+        tokens = [t for t in rest.split() if len(t) > 1]
+        hostname: str | None = None
+        if tokens:
+            hostname = max(tokens, key=len)
+            if hostname.lower() in {"---", "n/a", "unknown", "host", "id"}:
+                hostname = None
+        out[mac] = Device(mac=mac, ip=ip, hostname=hostname)
+    return out
 
 
 def _parse_flow(html: str) -> list[FlowSample]:

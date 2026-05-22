@@ -36,7 +36,13 @@ DHCP_PATHS = [
 ]
 
 FLOW_PATHS = [
-    "/cgi-bin/dataflow.cgi",        # modern Vigor firmware (token required)
+    # Vigor 2765 modern firmware: dispatcher CGI with function ID 2096.
+    # Redirects to /doc/digdatam.htm which holds the actual table.
+    # NOTE: requires "Enable Data Flow Monitor" to be ticked in the router UI.
+    "/cgi-bin/v2x00.cgi?fid=2096",
+    "/doc/digdatam.htm",
+    # Older / alternate firmware paths
+    "/cgi-bin/dataflow.cgi",
     "/cgi-bin/dataFlowMonitor.cgi",
     "/cgi-bin/datafm.cgi",
     "/doc/dataFlowM.sht",
@@ -602,4 +608,42 @@ def _parse_flow(html: str) -> list[FlowSample]:
             )
         if out:
             break  # first table that yielded data wins
+
+    if not out:
+        out = _parse_flow_text(html)
+    return out
+
+
+def _parse_flow_text(html: str) -> list[FlowSample]:
+    """Fallback for text-grid Data Flow Monitor pages (Vigor 2765).
+    Each row looks like:
+        Index  IP            TX Rate(bps)         RX Rate(bps)         Sessions
+        1      192.168.1.15  1.2 K / 5.4 M /Auto  12.3 K / 87 M /Auto  5
+    The rate cells are 'Current / Peak / Speed'; we take the first number
+    (Current) as the live rate.
+    """
+    text = re.sub(r"<[^>]+>", " ", html)
+    out: list[FlowSample] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        ip_m = IP_RE.search(line)
+        if not ip_m:
+            continue
+        ip = ip_m.group(0)
+        if ip.startswith(("0.", "255.")):
+            continue
+        rest = line[ip_m.end():]
+        # rate cells appear as e.g. "1.2 K / 5.4 M /Auto"  -- grab the first numeric token
+        numbers = re.findall(r"\d+(?:\.\d+)?\s*[KMG]?", rest)
+        if len(numbers) < 2:
+            continue
+        tx_bps = _to_bps(numbers[0] + "bps")
+        # rate cells are 3-wide (Current/Peak/Speed). RX current = 4th number
+        rx_idx = 3 if len(numbers) >= 4 else 1
+        rx_bps = _to_bps(numbers[rx_idx] + "bps")
+        sess_m = re.search(r"\b(\d+)\b\s*$", rest)
+        sessions = int(sess_m.group(1)) if sess_m else None
+        out.append(FlowSample(ip=ip, mac=None, tx_bps=tx_bps, rx_bps=rx_bps, sessions=sessions))
     return out

@@ -482,16 +482,14 @@ class DraytekClient:
         """
         client = await self._ensure_client()
 
-        # Strategy 1: cookie value as token.
+        # Strategy 1: cookie value as token, OR a base64-decoded substring
+        # of it (some Vigor builds store the token inside an encoded blob).
         for name, value in client.cookies.items():
-            if not value or not (10 <= len(value) <= 64):
-                continue
-            if not re.fullmatch(r"[A-Za-z0-9]+", value):
-                continue
-            if await self._token_works(client, value):
-                self._form_auth_token = value
-                log.info("sFormAuthStr resolved from cookie '%s' (%d chars)", name, len(value))
-                return value
+            for candidate in _cookie_token_candidates(value):
+                if await self._token_works(client, candidate):
+                    self._form_auth_token = candidate
+                    log.info("sFormAuthStr resolved from cookie '%s' (%d chars)", name, len(candidate))
+                    return candidate
 
         # Strategy 2: scan likely pages and JS files for the token.
         sources = TOKEN_PAGES + TOKEN_JS_FILES
@@ -563,6 +561,35 @@ class DraytekClient:
         if not html:
             return []
         return _parse_flow(html)
+
+
+def _cookie_token_candidates(value: str) -> list[str]:
+    """Yield possible sFormAuthStr tokens derived from a session-cookie
+    value: the raw value, the base64-decoded value, and any alphanumeric
+    substring 10-32 chars long from either."""
+    out: list[str] = []
+    if not value:
+        return out
+    seen: set[str] = set()
+
+    def add(v: str) -> None:
+        v = v.strip()
+        if 10 <= len(v) <= 64 and re.fullmatch(r"[A-Za-z0-9]+", v) and v not in seen:
+            seen.add(v)
+            out.append(v)
+
+    add(value)
+    # try base64 decoding both as standard and url-safe, with padding fixups
+    for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+        for pad in ("", "=", "==", "==="):
+            try:
+                decoded = decoder(value + pad).decode("ascii", errors="ignore")
+            except Exception:
+                continue
+            add(decoded)
+            for sub in re.findall(r"[A-Za-z0-9]{10,32}", decoded):
+                add(sub)
+    return out
 
 
 def _looks_authenticated(html: str) -> bool:

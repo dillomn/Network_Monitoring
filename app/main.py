@@ -119,6 +119,95 @@ async def debug_discover() -> JSONResponse:
         await client.close()
 
 
+@app.get("/debug/login-trace")
+async def debug_login_trace() -> JSONResponse:
+    """Walks the login flow WITHOUT following redirects so we can see
+    every Set-Cookie / Location header and full body chunk-by-chunk.
+    Used to find where on this firmware the sFormAuthStr token actually
+    arrives (login response body? redirect Location header? Set-Cookie?)."""
+    import base64
+    import httpx
+    from app.config import settings
+    from app.draytek import DraytekClient, LOGIN_PATHS
+
+    client = DraytekClient()
+    await client._discover_base()
+    base = client._base()
+
+    async with httpx.AsyncClient(
+        base_url=base,
+        verify=settings.router_verify_ssl,
+        timeout=15.0,
+        follow_redirects=False,
+        headers={"User-Agent": "Mozilla/5.0 (DraytekMonitor)"},
+    ) as c:
+        steps = []
+
+        # Prime
+        try:
+            r = await c.get("/")
+            steps.append({"step": "GET /", "status": r.status_code,
+                          "location": r.headers.get("location"),
+                          "set_cookie": r.headers.get_list("set-cookie"),
+                          "body_head": r.text[:600]})
+        except Exception as e:
+            steps.append({"step": "GET /", "error": str(e)})
+
+        # Login POST (no follow)
+        aa = base64.b64encode(settings.router_user.encode()).decode()
+        ab = base64.b64encode(settings.router_password.encode()).decode()
+        for path in LOGIN_PATHS:
+            try:
+                r = await c.post(path, data={
+                    "aa": aa, "ab": ab,
+                    "ja_name": settings.router_user, "ja_passwd": "",
+                    "username": settings.router_user, "password": settings.router_password,
+                })
+                steps.append({
+                    "step": f"POST {path}",
+                    "status": r.status_code,
+                    "location": r.headers.get("location"),
+                    "set_cookie": r.headers.get_list("set-cookie"),
+                    "all_headers": dict(r.headers),
+                    "body_len": len(r.text),
+                    "body_head": r.text[:1500],
+                    "body_token_hits": __import__("re").findall(
+                        r"sFormAuthStr=[A-Za-z0-9]{8,}", r.text)[:5],
+                })
+                # If we got a redirect, manually follow up to 4 hops
+                hops = 0
+                while hops < 4:
+                    loc = r.headers.get("location")
+                    if not loc:
+                        break
+                    next_url = loc if loc.startswith(("http://", "https://")) else loc
+                    try:
+                        r = await c.get(next_url)
+                    except Exception as e:
+                        steps.append({"step": f"redirect GET {next_url}", "error": str(e)})
+                        break
+                    steps.append({
+                        "step": f"redirect GET {next_url}",
+                        "status": r.status_code,
+                        "location": r.headers.get("location"),
+                        "set_cookie": r.headers.get_list("set-cookie"),
+                        "body_len": len(r.text),
+                        "body_head": r.text[:1500],
+                        "body_token_hits": __import__("re").findall(
+                            r"sFormAuthStr=[A-Za-z0-9]{8,}", r.text)[:5],
+                    })
+                    hops += 1
+                    if r.status_code < 300:
+                        break
+                if r and r.status_code == 200:
+                    break  # we got somewhere
+            except Exception as e:
+                steps.append({"step": f"POST {path}", "error": str(e)})
+
+        return JSONResponse({"base_url": base, "steps": steps,
+                             "final_cookies": {k: v for k, v in c.cookies.items()}})
+
+
 @app.get("/debug/login")
 async def debug_login() -> JSONResponse:
     """Returns what every login strategy sent and what the router responded

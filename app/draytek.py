@@ -59,7 +59,26 @@ LOGIN_PATHS = [
 LOGIN_FORM_MARKERS = (
     'name="aa"', 'name="ab"', 'name="username"', "wlogin",
     "login.htm", "vigor login", "operation timeout", "session timeout",
+    "authorization error",
 )
+
+# Real tokens we've observed on this firmware are 14-15 chars (e.g. "9SJmXlA6TPCAHIO").
+# Require >=10 to skip false matches like JS concatenation `'sFormAuthStr=' + uToken`.
+TOKEN_PATTERNS = [
+    re.compile(r"sFormAuthStr=([A-Za-z0-9]{10,})"),
+    re.compile(r"""sFormAuthStr\s*[:=]\s*['"]([A-Za-z0-9]{10,})['"]"""),
+    re.compile(r"""sToken\s*[:=]\s*['"]([A-Za-z0-9]{10,})['"]"""),
+    re.compile(r"""['"]sFormAuthStr['"]\s*[:=]\s*['"]([A-Za-z0-9]{10,})['"]"""),
+]
+
+# Pages most likely to contain the per-session token. Tried in order.
+TOKEN_PAGES = [
+    "/cgi-bin/menu.htm", "/cgi-bin/menu.cgi",
+    "/cgi-bin/index.cgi", "/cgi-bin/dashboard.htm",
+    "/cgi-bin/v2x00.cgi", "/cgi-bin/v2x00.cgi?fid=1",
+    "/main.html", "/index.html", "/dashboard.html",
+    "/",
+]
 
 
 @dataclass
@@ -283,6 +302,7 @@ class DraytekClient:
         If logged in, self._client is left in an authenticated state.
         """
         await self.close()  # discard any half-state from prior attempts
+        self._form_auth_token = None  # force re-extraction on every fresh login
         await self._discover_base()
 
         # Strategy 1: HTTP Basic Auth (DrayTek's CGI pages accept it on many builds)
@@ -307,13 +327,17 @@ class DraytekClient:
                     "username": settings.router_user, "password": settings.router_password,
                 })
                 log.debug("Form POST %s -> %s", path, r.status_code)
+                # The login POST response body is the post-login dashboard SPA,
+                # which often contains the sFormAuthStr token directly.
+                self._try_extract_token(r.text, f"POST {path} response")
             except Exception as e:
                 log.debug("Form POST %s raised: %s", path, e)
                 continue
             if await self._probe_authenticated(c):
                 log.info("Authenticated via form POST at %s", path)
                 self._client = c
-                await self._refresh_form_auth_token()
+                if not self._form_auth_token:
+                    await self._refresh_form_auth_token()
                 return True
 
         await c.aclose()
@@ -414,24 +438,43 @@ class DraytekClient:
 
         return diag
 
+    def _try_extract_token(self, text: str, source: str) -> bool:
+        """Run every TOKEN_PATTERN against `text`; cache the first match
+        whose length looks plausible. Returns True if a token was found."""
+        if not text:
+            return False
+        for pat in TOKEN_PATTERNS:
+            m = pat.search(text)
+            if m and len(m.group(1)) >= 10:
+                self._form_auth_token = m.group(1)
+                log.info("Cached sFormAuthStr token (%d chars) from %s",
+                         len(self._form_auth_token), source)
+                return True
+        return False
+
     async def _refresh_form_auth_token(self) -> str | None:
-        """Modern Vigor firmware ties every data CGI to a per-session
-        `sFormAuthStr` token that's planted in the dashboard HTML. Find
-        and cache it so subsequent requests can pass it as a query arg."""
+        """Fetch a sequence of likely dashboard pages and extract the
+        per-session `sFormAuthStr` token. Also walks any JS files
+        referenced by each page in case the token is set there."""
         client = await self._ensure_client()
-        for page in ("/", "/main.html", "/index.html"):
+        for page in TOKEN_PAGES:
             try:
                 r = await client.get(page)
             except Exception:
                 continue
-            if r.status_code != 200:
+            if r.status_code != 200 or not r.text:
                 continue
-            m = re.search(r"sFormAuthStr=([A-Za-z0-9]+)", r.text)
-            if m:
-                self._form_auth_token = m.group(1)
-                log.info("Cached sFormAuthStr token from %s", page)
+            if self._try_extract_token(r.text, page):
                 return self._form_auth_token
-        log.warning("Could not find sFormAuthStr in any dashboard page")
+            # Also scan any JS files this page links to
+            for js_url in re.findall(r"""['"](/[^'"\s<>]+\.js(?:\?[^'"\s<>]*)?)['"]""", r.text)[:10]:
+                try:
+                    jr = await client.get(js_url)
+                except Exception:
+                    continue
+                if jr.status_code == 200 and self._try_extract_token(jr.text, js_url):
+                    return self._form_auth_token
+        log.warning("Could not find sFormAuthStr in any dashboard page or JS")
         return None
 
     async def _fetch_first(self, paths: list[str]) -> tuple[str, str] | None:

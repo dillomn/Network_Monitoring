@@ -81,6 +81,24 @@ async def set_note(mac: str, body: NoteIn) -> dict:
 
 # ------- Debug endpoints (use to tune scraping against your firmware) -------
 
+@app.get("/debug/token")
+async def debug_token() -> dict:
+    """Logs in fresh and reports the sFormAuthStr token we extracted, plus
+    a list of pages tried. Use this to confirm we cached a real token
+    (15ish chars) rather than a one-letter false match."""
+    client = DraytekClient()
+    try:
+        ok = await client.login()
+        return {
+            "login_ok": ok,
+            "token": client._form_auth_token,
+            "token_len": len(client._form_auth_token) if client._form_auth_token else 0,
+            "discovered_base_url": client._discovered_base,
+        }
+    finally:
+        await client.close()
+
+
 @app.get("/debug/discover")
 async def debug_discover() -> JSONResponse:
     """Authenticate against the router, then walk the SPA's JS bundles to

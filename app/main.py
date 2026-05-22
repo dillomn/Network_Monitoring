@@ -83,17 +83,26 @@ async def set_note(mac: str, body: NoteIn) -> dict:
 
 @app.get("/debug/token")
 async def debug_token() -> dict:
-    """Logs in fresh and reports the sFormAuthStr token we extracted, plus
-    a list of pages tried. Use this to confirm we cached a real token
-    (15ish chars) rather than a one-letter false match."""
+    """Logs in fresh and reports the sFormAuthStr token we resolved, plus
+    every session cookie the router set. Compare the cookie value to the
+    `sFormAuthStr=...` value the browser uses — if they match in length
+    and format, the cookie-as-token strategy should work."""
     client = DraytekClient()
     try:
         ok = await client.login()
+        cookies = {}
+        if client._client is not None:
+            for name, value in client._client.cookies.items():
+                cookies[name] = {
+                    "value": value,
+                    "length": len(value) if value else 0,
+                }
         return {
             "login_ok": ok,
             "token": client._form_auth_token,
             "token_len": len(client._form_auth_token) if client._form_auth_token else 0,
             "discovered_base_url": client._discovered_base,
+            "session_cookies": cookies,
         }
     finally:
         await client.close()

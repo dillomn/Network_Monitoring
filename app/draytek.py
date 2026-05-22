@@ -73,11 +73,19 @@ TOKEN_PATTERNS = [
 
 # Pages most likely to contain the per-session token. Tried in order.
 TOKEN_PAGES = [
+    "/doc/digdatam.htm",
     "/cgi-bin/menu.htm", "/cgi-bin/menu.cgi",
     "/cgi-bin/index.cgi", "/cgi-bin/dashboard.htm",
     "/cgi-bin/v2x00.cgi", "/cgi-bin/v2x00.cgi?fid=1",
     "/main.html", "/index.html", "/dashboard.html",
     "/",
+]
+
+# JS files known to handle the form-submission + token-injection logic
+# on modern Vigor firmware. Scanned alongside the dashboard pages.
+TOKEN_JS_FILES = [
+    "/js/webchange.js?140017", "/js/webchange.js",
+    "/js/dhtml.min.js?140017", "/js/dhtml.min.js",
 ]
 
 
@@ -452,29 +460,66 @@ class DraytekClient:
                 return True
         return False
 
+    async def _token_works(self, client: httpx.AsyncClient, token: str) -> bool:
+        """Verify a candidate sFormAuthStr by actually trying it against a
+        token-required endpoint. The router redirects bad tokens to
+        /doc/autherror.htm, which is how we know it rejected us."""
+        try:
+            r = await client.get(f"/cgi-bin/dhcp.cgi?sFormAuthStr={token}")
+        except Exception:
+            return False
+        final = str(r.url).lower()
+        if "autherror" in final or "weblogin" in final or "wlogin" in final:
+            return False
+        return r.status_code == 200 and len(r.text) > 500
+
     async def _refresh_form_auth_token(self) -> str | None:
-        """Fetch a sequence of likely dashboard pages and extract the
-        per-session `sFormAuthStr` token. Also walks any JS files
-        referenced by each page in case the token is set there."""
+        """Find the per-session sFormAuthStr in (in order):
+        1. The SESSION_ID_VIGOR cookie value (some Vigor builds reuse it).
+        2. Embedded in dashboard pages + JS files (webchange.js, etc.)
+        Every candidate is verified by hitting a token-required URL — we
+        no longer trust the first regex match.
+        """
         client = await self._ensure_client()
-        for page in TOKEN_PAGES:
+
+        # Strategy 1: cookie value as token.
+        for name, value in client.cookies.items():
+            if not value or not (10 <= len(value) <= 64):
+                continue
+            if not re.fullmatch(r"[A-Za-z0-9]+", value):
+                continue
+            if await self._token_works(client, value):
+                self._form_auth_token = value
+                log.info("sFormAuthStr resolved from cookie '%s' (%d chars)", name, len(value))
+                return value
+
+        # Strategy 2: scan likely pages and JS files for the token.
+        sources = TOKEN_PAGES + TOKEN_JS_FILES
+        for path in sources:
             try:
-                r = await client.get(page)
+                r = await client.get(path)
             except Exception:
                 continue
             if r.status_code != 200 or not r.text:
                 continue
-            if self._try_extract_token(r.text, page):
+            if self._try_extract_token(r.text, path) and await self._token_works(client, self._form_auth_token):
                 return self._form_auth_token
-            # Also scan any JS files this page links to
-            for js_url in re.findall(r"""['"](/[^'"\s<>]+\.js(?:\?[^'"\s<>]*)?)['"]""", r.text)[:10]:
+            self._form_auth_token = None  # extracted but didn't verify -> discard
+            # Also follow any JS files referenced from this page.
+            for js_url in re.findall(r"(/[A-Za-z0-9_./\-]+\.js(?:\?[A-Za-z0-9]*)?)", r.text)[:20]:
                 try:
                     jr = await client.get(js_url)
                 except Exception:
                     continue
-                if jr.status_code == 200 and self._try_extract_token(jr.text, js_url):
+                if (
+                    jr.status_code == 200
+                    and self._try_extract_token(jr.text, js_url)
+                    and await self._token_works(client, self._form_auth_token)
+                ):
                     return self._form_auth_token
-        log.warning("Could not find sFormAuthStr in any dashboard page or JS")
+                self._form_auth_token = None
+
+        log.warning("Could not find a working sFormAuthStr token (login OK, cookie present, but no path through)")
         return None
 
     async def _fetch_first(self, paths: list[str]) -> tuple[str, str] | None:

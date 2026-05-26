@@ -2,11 +2,23 @@ import asyncio
 import logging
 import time
 
+import asyncssh
+
 from . import db
 from .collectors.ssh import DraytekCollector, DraytekSession
 from .config import settings
 
 log = logging.getLogger(__name__)
+
+# Exceptions on which we drop the persistent session and reconnect next poll.
+# Anything else (parser bugs, DB errors) is logged but the session stays open.
+_TRANSPORT_ERRORS = (
+    asyncssh.Error,
+    asyncio.TimeoutError,
+    ConnectionError,
+    EOFError,
+    OSError,
+)
 
 
 class Poller:
@@ -20,6 +32,7 @@ class Poller:
         self.router_firmware: str | None = None
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        self._session: DraytekSession | None = None
 
     async def start(self) -> None:
         db.init_db()
@@ -29,6 +42,27 @@ class Poller:
         self._stop.set()
         if self._task:
             await self._task
+        await self._drop_session()
+
+    async def _ensure_session(self) -> DraytekSession:
+        if self._session is None:
+            s = DraytekSession()
+            await s.__aenter__()
+            self._session = s
+            log.info("SSH session opened to %s:%s", settings.router_host, settings.router_ssh_port)
+        return self._session
+
+    async def _drop_session(self) -> None:
+        """Close and discard the cached session. Safe to call even if the
+        session is already half-dead — we suppress errors during teardown
+        because the next poll will just reconnect."""
+        if self._session is None:
+            return
+        s, self._session = self._session, None
+        try:
+            await s.__aexit__(None, None, None)
+        except Exception as e:
+            log.debug("Ignoring error while closing dead session: %s", e)
 
     async def _run(self) -> None:
         prune_counter = 0
@@ -37,10 +71,19 @@ class Poller:
                 await self._poll_once()
                 self.last_poll_ok = True
                 self.last_error = None
-            except Exception as e:
+            except _TRANSPORT_ERRORS as e:
+                # Transport-level failure — invalidate the cached session
+                # so the next poll opens a fresh one.
                 self.last_poll_ok = False
                 self.last_error = f"{type(e).__name__}: {e}"
-                log.exception("Poll failed")
+                log.warning("Poll failed (transport): %s — will reconnect next cycle", self.last_error)
+                await self._drop_session()
+            except Exception as e:
+                # Non-transport failure (parser, DB, etc.) — the SSH session
+                # is probably fine; keep it and just log.
+                self.last_poll_ok = False
+                self.last_error = f"{type(e).__name__}: {e}"
+                log.exception("Poll failed (non-transport)")
 
             self.last_poll_ts = int(time.time())
             prune_counter += 1
@@ -59,28 +102,29 @@ class Poller:
                 pass
 
     async def _poll_once(self) -> None:
-        """One SSH session per poll: connect, batch all queries, disconnect.
+        """Reuse the persistent SSH session across polls.
 
-        The batch is cheap (4 + N commands where N is the device count) and
-        per-poll connect avoids stale-session headaches with DrayTek's SSH
-        idle timeout. If N grows huge we can switch to keep-alive later.
+        Layout:
+            - Cache model/firmware on first successful query.
+            - Run DHCP + ARP to learn the LAN.
+            - Run `show traffic <ip>` for each discovered IP.
+            - DB writes happen after queries so a slow disk doesn't hold
+              the SSH session open longer than needed.
         """
-        async with DraytekSession() as session:
-            # First poll caches model/firmware for /api/health visibility.
-            if self.router_model is None:
-                info = await self.collector.router_info(session)
-                self.router_model = info.model
-                self.router_firmware = info.firmware
-                log.info("Connected to %s (firmware %s)", info.model, info.firmware)
+        session = await self._ensure_session()
 
-            devices = await self.collector.devices(session)
-            for d in devices:
-                db.upsert_device(d.mac, d.ip, d.hostname)
+        if self.router_model is None:
+            info = await self.collector.router_info(session)
+            self.router_model = info.model
+            self.router_firmware = info.firmware
+            log.info("Connected to %s (firmware %s)", info.model, info.firmware)
 
-            ip_to_mac = {d.ip: d.mac for d in devices}
-            flows = await self.collector.flow(list(ip_to_mac.keys()), session)
+        devices = await self.collector.devices(session)
+        ip_to_mac = {d.ip: d.mac for d in devices}
+        flows = await self.collector.flow(list(ip_to_mac.keys()), session)
 
-        # DB writes outside the SSH session — sqlite is local, sub-ms.
+        for d in devices:
+            db.upsert_device(d.mac, d.ip, d.hostname)
         for f in flows:
             mac = f.mac or ip_to_mac.get(f.ip)
             if not mac:

@@ -7,7 +7,12 @@
       "Bash(curl -s \"https://hub.docker.com/v2/repositories/ntop/?page_size=100\")",
       "Bash(curl -s \"https://hub.docker.com/v2/repositories/ntop/ntopng_arm64.dev/tags?page_size=10\")",
       "Bash(cd \"c:/Users/DillonBrooks/CCTS/Shared - Documents/Team/SD Technicians/AutomatedSlaveSuite/Docker/Network_Monitoring\" && rm -rf prometheus grafana && ls -la)",
-      "Bash(python3 -m py_compile app/config.py app/db.py app/poller.py app/main.py app/oui.py app/collectors/base.py app/collectors/ssh.py app/parsers/cli.py)"
+      "Bash(python3 -m py_compile app/config.py app/db.py app/poller.py app/main.py app/oui.py app/collectors/base.py app/collectors/ssh.py app/parsers/cli.py)",
+      "Bash(python3 -m py_compile app/poller.py app/collectors/ssh.py)",
+      "Bash(mkdir -p /Users/dillonbrooks/DrayMon/Network_Monitoring/app/static/vendor)",
+      "Bash(curl -sS -o chart.umd.min.js https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js)",
+      "Bash(curl -sS -o chartjs-adapter-date-fns.bundle.min.js https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js)",
+      "Bash(file /Users/dillonbrooks/DrayMon/Network_Monitoring/app/static/vendor/*.js)"
     ],
     "additionalDirectories": [
       "c:\\Users\\DillonBrooks\\CCTS\\Shared - Documents\\Team\\SD Technicians\\AutomatedSlaveSuite\\Docker\\Network_Monitoring\\prometheus"

@@ -86,6 +86,10 @@ class DraytekSession:
             port=settings.router_ssh_port,
             username=settings.router_ssh_user,
             password=settings.router_ssh_password,
+            # Send SSH-level keepalives so a long-lived session survives the
+            # DrayTek's idle timeout (mngt sshtimeout). Drop after 3 missed.
+            keepalive_interval=30,
+            keepalive_count_max=3,
             **LEGACY_SSH_KWARGS,
         )
         # Wide terminal reduces forced pagination; vt100 is safest.

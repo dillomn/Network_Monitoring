@@ -6,7 +6,8 @@
       "Bash(curl -s \"https://hub.docker.com/v2/repositories/ntop/?page_size=50\")",
       "Bash(curl -s \"https://hub.docker.com/v2/repositories/ntop/?page_size=100\")",
       "Bash(curl -s \"https://hub.docker.com/v2/repositories/ntop/ntopng_arm64.dev/tags?page_size=10\")",
-      "Bash(cd \"c:/Users/DillonBrooks/CCTS/Shared - Documents/Team/SD Technicians/AutomatedSlaveSuite/Docker/Network_Monitoring\" && rm -rf prometheus grafana && ls -la)"
+      "Bash(cd \"c:/Users/DillonBrooks/CCTS/Shared - Documents/Team/SD Technicians/AutomatedSlaveSuite/Docker/Network_Monitoring\" && rm -rf prometheus grafana && ls -la)",
+      "Bash(python3 -m py_compile app/config.py app/db.py app/poller.py app/main.py app/oui.py app/collectors/base.py app/collectors/ssh.py app/parsers/cli.py)"
     ],
     "additionalDirectories": [
       "c:\\Users\\DillonBrooks\\CCTS\\Shared - Documents\\Team\\SD Technicians\\AutomatedSlaveSuite\\Docker\\Network_Monitoring\\prometheus"

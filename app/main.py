@@ -9,8 +9,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import db, oui
+from .collectors.ssh import DraytekCollector, DraytekSession
 from .config import settings
-from .draytek import DraytekClient
 from .poller import poller
 
 logging.basicConfig(
@@ -23,7 +23,10 @@ log = logging.getLogger("draymon")
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await poller.start()
-    log.info("Poller started (router=%s every %ss)", settings.router_host, settings.poll_interval)
+    log.info(
+        "Poller started (router=%s ssh:%s every %ss)",
+        settings.router_host, settings.router_ssh_port, settings.poll_interval,
+    )
     try:
         yield
     finally:
@@ -41,15 +44,20 @@ async def index() -> str:
     return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
 
+# --------------- App API (consumed by the bundled frontend) ---------------
+
 @app.get("/api/health")
 async def health() -> dict:
     return {
         "router": settings.router_host,
+        "router_model": poller.router_model,
+        "router_firmware": poller.router_firmware,
         "poll_interval_s": settings.poll_interval,
         "last_poll_ts": poller.last_poll_ts,
         "last_poll_age_s": (int(time.time()) - poller.last_poll_ts) if poller.last_poll_ts else None,
         "last_poll_ok": poller.last_poll_ok,
         "last_error": poller.last_error,
+        "device_count": poller.last_device_count,
     }
 
 
@@ -79,173 +87,112 @@ async def set_note(mac: str, body: NoteIn) -> dict:
     return {"ok": True}
 
 
-# ------- Debug endpoints (use to tune scraping against your firmware) -------
+# ---------------------- Debug endpoints (SSH-based) ----------------------
+# All endpoints below open a fresh SSH session so they don't interfere
+# with the background poller. Hit them with `curl -s localhost:8090/debug/...`.
 
-@app.get("/debug/token")
-async def debug_token() -> dict:
-    """Logs in fresh and reports the sFormAuthStr token we resolved, plus
-    every session cookie the router set. Compare the cookie value to the
-    `sFormAuthStr=...` value the browser uses — if they match in length
-    and format, the cookie-as-token strategy should work."""
-    client = DraytekClient()
+_DEBUG_CMD_ALLOWLIST = (
+    "sys version", "srv dhcp status", "ip arp status", "show statistic",
+    "show session", "show traffic",  # show traffic <ip> tx/rx
+)
+
+
+@app.get("/debug/ssh/info")
+async def debug_info() -> dict:
+    """Connects, runs `sys version`, returns model/firmware. Sanity check
+    that SSH credentials and the legacy-algorithm list work for your unit."""
+    collector = DraytekCollector()
     try:
-        ok = await client.login()
-        cookies = {}
-        if client._client is not None:
-            for name, value in client._client.cookies.items():
-                cookies[name] = {
-                    "value": value,
-                    "length": len(value) if value else 0,
-                }
-        return {
-            "login_ok": ok,
-            "token": client._form_auth_token,
-            "token_len": len(client._form_auth_token) if client._form_auth_token else 0,
-            "discovered_base_url": client._discovered_base,
-            "session_cookies": cookies,
-        }
-    finally:
-        await client.close()
+        info = await collector.router_info()
+        return {"ok": True, "model": info.model, "firmware": info.firmware, "router_name": info.router_name}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
-@app.get("/debug/discover")
-async def debug_discover() -> JSONResponse:
-    """Authenticate against the router, then walk the SPA's JS bundles to
-    find candidate JSON API endpoints (DHCP table, Data Flow, etc.)."""
-    client = DraytekClient()
+@app.get("/debug/ssh/exec", response_class=PlainTextResponse)
+async def debug_exec(cmd: str = Query(..., min_length=1, max_length=200)) -> str:
+    """Run an arbitrary (allowlisted-prefix) CLI command. Used for ad-hoc
+    inspection of new firmware output. The allowlist is anchored at the
+    *start* of cmd to prevent shell-style command chaining (DrayTek CLI
+    doesn't support `;`/`&&` but we filter anyway as defence in depth)."""
+    if not any(cmd.startswith(prefix) for prefix in _DEBUG_CMD_ALLOWLIST):
+        raise HTTPException(400, f"cmd must start with one of: {_DEBUG_CMD_ALLOWLIST}")
     try:
-        return JSONResponse(await client.discover_api())
-    finally:
-        await client.close()
+        async with DraytekSession() as s:
+            return await s.query(cmd)
+    except Exception as e:
+        raise HTTPException(502, f"{type(e).__name__}: {e}")
 
 
-@app.get("/debug/login-trace")
-async def debug_login_trace() -> JSONResponse:
-    """Walks the login flow WITHOUT following redirects so we can see
-    every Set-Cookie / Location header and full body chunk-by-chunk.
-    Used to find where on this firmware the sFormAuthStr token actually
-    arrives (login response body? redirect Location header? Set-Cookie?)."""
-    import base64
-    import httpx
-    from app.config import settings
-    from app.draytek import DraytekClient, LOGIN_PATHS
-
-    client = DraytekClient()
-    await client._discover_base()
-    base = client._base()
-
-    async with httpx.AsyncClient(
-        base_url=base,
-        verify=settings.router_verify_ssl,
-        timeout=15.0,
-        follow_redirects=False,
-        headers={"User-Agent": "Mozilla/5.0 (DraytekMonitor)"},
-    ) as c:
-        steps = []
-
-        # Prime
-        try:
-            r = await c.get("/")
-            steps.append({"step": "GET /", "status": r.status_code,
-                          "location": r.headers.get("location"),
-                          "set_cookie": r.headers.get_list("set-cookie"),
-                          "body_head": r.text[:600]})
-        except Exception as e:
-            steps.append({"step": "GET /", "error": str(e)})
-
-        # Login POST (no follow)
-        aa = base64.b64encode(settings.router_user.encode()).decode()
-        ab = base64.b64encode(settings.router_password.encode()).decode()
-        for path in LOGIN_PATHS:
-            try:
-                r = await c.post(path, data={
-                    "aa": aa, "ab": ab,
-                    "ja_name": settings.router_user, "ja_passwd": "",
-                    "username": settings.router_user, "password": settings.router_password,
-                })
-                steps.append({
-                    "step": f"POST {path}",
-                    "status": r.status_code,
-                    "location": r.headers.get("location"),
-                    "set_cookie": r.headers.get_list("set-cookie"),
-                    "all_headers": dict(r.headers),
-                    "body_len": len(r.text),
-                    "body_head": r.text[:1500],
-                    "body_token_hits": __import__("re").findall(
-                        r"sFormAuthStr=[A-Za-z0-9]{8,}", r.text)[:5],
-                })
-                # If we got a redirect, manually follow up to 4 hops
-                hops = 0
-                while hops < 4:
-                    loc = r.headers.get("location")
-                    if not loc:
-                        break
-                    next_url = loc if loc.startswith(("http://", "https://")) else loc
-                    try:
-                        r = await c.get(next_url)
-                    except Exception as e:
-                        steps.append({"step": f"redirect GET {next_url}", "error": str(e)})
-                        break
-                    steps.append({
-                        "step": f"redirect GET {next_url}",
-                        "status": r.status_code,
-                        "location": r.headers.get("location"),
-                        "set_cookie": r.headers.get_list("set-cookie"),
-                        "body_len": len(r.text),
-                        "body_head": r.text[:1500],
-                        "body_token_hits": __import__("re").findall(
-                            r"sFormAuthStr=[A-Za-z0-9]{8,}", r.text)[:5],
-                    })
-                    hops += 1
-                    if r.status_code < 300:
-                        break
-                if r and r.status_code == 200:
-                    break  # we got somewhere
-            except Exception as e:
-                steps.append({"step": f"POST {path}", "error": str(e)})
-
-        return JSONResponse({"base_url": base, "steps": steps,
-                             "final_cookies": {k: v for k, v in c.cookies.items()}})
-
-
-@app.get("/debug/login")
-async def debug_login() -> JSONResponse:
-    """Returns what every login strategy sent and what the router responded
-    with. Use this when 'Router login failed' shows up — paste the output
-    so we can match the auth flow to your specific firmware."""
-    client = DraytekClient()
+@app.get("/debug/ssh/devices")
+async def debug_devices() -> JSONResponse:
+    """Parsed device list straight from SSH (no DB)."""
+    collector = DraytekCollector()
     try:
-        return JSONResponse(await client.diagnose_login())
-    finally:
-        await client.close()
+        devs = await collector.devices()
+        return JSONResponse([vars(d) for d in devs])
+    except Exception as e:
+        raise HTTPException(502, f"{type(e).__name__}: {e}")
 
 
-@app.get("/debug/raw", response_class=PlainTextResponse)
-async def debug_raw(page: str = Query("flow", pattern="^(flow|dhcp)$")) -> str:
-    """Returns the raw HTML the scraper fetched. Use this when devices or
-    flow rows aren't parsing as expected."""
-    client = DraytekClient()
+@app.get("/debug/ssh/flow")
+async def debug_flow(ip: str | None = Query(None)) -> JSONResponse:
+    """Per-IP bandwidth as the collector sees it. If `ip` is given, polls
+    just that IP; otherwise discovers devices first then polls all."""
+    collector = DraytekCollector()
     try:
-        if not await client.login():
-            raise HTTPException(502, "router login failed")
-        html = await (client.fetch_flow_html() if page == "flow" else client.fetch_dhcp_html())
-        if html is None:
-            raise HTTPException(404, f"no candidate {page} URL responded")
-        return html
-    finally:
-        await client.close()
+        async with DraytekSession() as s:
+            if ip:
+                ips = [ip]
+            else:
+                devs = await collector.devices(s)
+                ips = [d.ip for d in devs if d.ip]
+            samples = await collector.flow(ips, s)
+        return JSONResponse([vars(s) for s in samples])
+    except Exception as e:
+        raise HTTPException(502, f"{type(e).__name__}: {e}")
 
 
-@app.get("/debug/parsed")
-async def debug_parsed(page: str = Query("flow", pattern="^(flow|dhcp)$")) -> JSONResponse:
-    client = DraytekClient()
+@app.get("/debug/ssh/wan")
+async def debug_wan() -> JSONResponse:
+    """Per-WAN lifetime byte counters from `show statistic`."""
+    collector = DraytekCollector()
     try:
-        if not await client.login():
-            raise HTTPException(502, "router login failed")
-        if page == "flow":
-            data = [vars(s) for s in await client.get_flow()]
-        else:
-            data = [vars(d) for d in await client.get_devices()]
-        return JSONResponse(data)
-    finally:
-        await client.close()
+        stats = await collector.wan_totals()
+        return JSONResponse([vars(s) for s in stats])
+    except Exception as e:
+        raise HTTPException(502, f"{type(e).__name__}: {e}")
+
+
+@app.get("/debug/calibrate")
+async def debug_calibrate(ip: str = Query(...), wait_s: int = Query(60, ge=10, le=300)) -> JSONResponse:
+    """Snapshot `show traffic <ip> rx` twice, `wait_s` apart, return both
+    plus a diff so we can see which positions in the time-series moved and
+    in which direction. Use to verify the 'last sample = newest' and
+    sample-interval assumptions baked into the parser."""
+    import asyncio
+    from .parsers.cli import parse_traffic_series
+    cmd = f"show traffic {ip} rx"
+    try:
+        async with DraytekSession() as s:
+            first = parse_traffic_series(await s.query(cmd), cmd)
+            await asyncio.sleep(wait_s)
+            second = parse_traffic_series(await s.query(cmd), cmd)
+        changed = [i for i, (a, b) in enumerate(zip(first, second)) if a != b]
+        return JSONResponse({
+            "ip": ip,
+            "wait_s": wait_s,
+            "len_first": len(first),
+            "len_second": len(second),
+            "first_tail": first[-10:],
+            "second_tail": second[-10:],
+            "changed_indices": changed,
+            "changed_count": len(changed),
+            "hint": (
+                "If changed_indices cluster near the END of the array, last=newest. "
+                "If near the START, first=newest. The spacing between changed indices "
+                "indicates the sample period (e.g. ~1 changed index per 60s of wait = per-minute samples)."
+            ),
+        })
+    except Exception as e:
+        raise HTTPException(502, f"{type(e).__name__}: {e}")

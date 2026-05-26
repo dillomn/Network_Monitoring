@@ -3,21 +3,23 @@ import logging
 import time
 
 from . import db
+from .collectors.ssh import DraytekCollector, DraytekSession
 from .config import settings
-from .draytek import DraytekClient
 
 log = logging.getLogger(__name__)
 
 
 class Poller:
     def __init__(self) -> None:
-        self.client = DraytekClient()
+        self.collector = DraytekCollector()
         self.last_poll_ts: int = 0
         self.last_poll_ok: bool = False
         self.last_error: str | None = None
+        self.last_device_count: int = 0
+        self.router_model: str | None = None
+        self.router_firmware: str | None = None
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
-        self._authed = False
 
     async def start(self) -> None:
         db.init_db()
@@ -27,7 +29,6 @@ class Poller:
         self._stop.set()
         if self._task:
             await self._task
-        await self.client.close()
 
     async def _run(self) -> None:
         prune_counter = 0
@@ -40,7 +41,6 @@ class Poller:
                 self.last_poll_ok = False
                 self.last_error = f"{type(e).__name__}: {e}"
                 log.exception("Poll failed")
-                self._authed = False
 
             self.last_poll_ts = int(time.time())
             prune_counter += 1
@@ -59,27 +59,35 @@ class Poller:
                 pass
 
     async def _poll_once(self) -> None:
-        if not self._authed:
-            ok = await self.client.login()
-            if not ok:
-                raise RuntimeError("Router login failed")
-            self._authed = True
+        """One SSH session per poll: connect, batch all queries, disconnect.
 
-        devices = await self.client.get_devices()
-        for d in devices:
-            db.upsert_device(d.mac, d.ip, d.hostname)
+        The batch is cheap (4 + N commands where N is the device count) and
+        per-poll connect avoids stale-session headaches with DrayTek's SSH
+        idle timeout. If N grows huge we can switch to keep-alive later.
+        """
+        async with DraytekSession() as session:
+            # First poll caches model/firmware for /api/health visibility.
+            if self.router_model is None:
+                info = await self.collector.router_info(session)
+                self.router_model = info.model
+                self.router_firmware = info.firmware
+                log.info("Connected to %s (firmware %s)", info.model, info.firmware)
 
-        ip_to_mac = {d.ip: d.mac for d in devices}
+            devices = await self.collector.devices(session)
+            for d in devices:
+                db.upsert_device(d.mac, d.ip, d.hostname)
 
-        flows = await self.client.get_flow()
+            ip_to_mac = {d.ip: d.mac for d in devices}
+            flows = await self.collector.flow(list(ip_to_mac.keys()), session)
+
+        # DB writes outside the SSH session — sqlite is local, sub-ms.
         for f in flows:
             mac = f.mac or ip_to_mac.get(f.ip)
             if not mac:
                 continue
-            # If flow gave us a MAC we hadn't seen in DHCP, register it.
-            if f.mac and f.mac not in ip_to_mac.values():
-                db.upsert_device(f.mac, f.ip, None)
             db.insert_sample(mac, f.tx_bps, f.rx_bps, f.sessions)
+
+        self.last_device_count = len(devices)
 
 
 poller = Poller()

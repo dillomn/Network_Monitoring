@@ -87,7 +87,8 @@ class Poller:
 
             self.last_poll_ts = int(time.time())
             prune_counter += 1
-            if prune_counter >= 360:  # roughly hourly at 10s interval
+            prune_every = max(60, 3600 // max(1, settings.poll_interval))
+            if prune_counter >= prune_every:  # roughly hourly
                 try:
                     deleted = db.prune_old_samples(settings.retention_days)
                     if deleted:

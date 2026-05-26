@@ -21,13 +21,20 @@
         <input id="filter" placeholder="filter by name / IP / MAC" />
       </div>
       <table id="device-table">
+        <colgroup>
+          <col class="col-device" />
+          <col class="col-ip" />
+          <col class="col-mac" />
+          <col class="col-rate" />
+          <col class="col-rate" />
+        </colgroup>
         <thead>
           <tr>
-            <th>Device</th>
-            <th>IP</th>
-            <th>MAC</th>
-            <th class="num">TX</th>
-            <th class="num">RX</th>
+            <th class="sortable" data-sort="hostname">Device <span class="sort-ind"></span></th>
+            <th class="sortable" data-sort="ip">IP <span class="sort-ind"></span></th>
+            <th class="sortable" data-sort="mac">MAC <span class="sort-ind"></span></th>
+            <th class="sortable num" data-sort="tx_bps">TX (upload) <span class="sort-ind"></span></th>
+            <th class="sortable num" data-sort="rx_bps">RX (download) <span class="sort-ind"></span></th>
           </tr>
         </thead>
         <tbody></tbody>

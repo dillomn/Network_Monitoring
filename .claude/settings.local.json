@@ -12,7 +12,13 @@
       "Bash(mkdir -p /Users/dillonbrooks/DrayMon/Network_Monitoring/app/static/vendor)",
       "Bash(curl -sS -o chart.umd.min.js https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js)",
       "Bash(curl -sS -o chartjs-adapter-date-fns.bundle.min.js https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js)",
-      "Bash(file /Users/dillonbrooks/DrayMon/Network_Monitoring/app/static/vendor/*.js)"
+      "Bash(file /Users/dillonbrooks/DrayMon/Network_Monitoring/app/static/vendor/*.js)",
+      "Bash(git rm *)",
+      "Bash(python -c \"import ast; [ast.parse\\(open\\(p\\).read\\(\\)\\) for p in ['app/config.py','app/main.py','app/poller.py','app/collectors/ssh.py','app/parsers/cli.py']]; print\\('all parse OK'\\)\")",
+      "Bash(py -c \"import ast; [ast.parse\\(open\\(p\\).read\\(\\)\\) for p in ['app/config.py','app/main.py','app/poller.py','app/collectors/ssh.py','app/parsers/cli.py']]; print\\('all parse OK'\\)\")",
+      "Bash(python3 -c \"import ast; [ast.parse\\(open\\(p\\).read\\(\\)\\) for p in ['app/config.py','app/main.py','app/poller.py','app/collectors/ssh.py','app/parsers/cli.py']]; print\\('all parse OK'\\)\")",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ],
     "additionalDirectories": [
       "c:\\Users\\DillonBrooks\\CCTS\\Shared - Documents\\Team\\SD Technicians\\AutomatedSlaveSuite\\Docker\\Network_Monitoring\\prometheus"

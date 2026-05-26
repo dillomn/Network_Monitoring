@@ -238,8 +238,8 @@ class DraytekCollector:
                 samples.append(FlowSample(
                     ip=ip,
                     mac=None,  # poller fills in from the device list
-                    tx_bps=_series_to_bps(tx_series),
-                    rx_bps=_series_to_bps(rx_series),
+                    tx_bps=series_to_bps(tx_series),
+                    rx_bps=series_to_bps(rx_series),
                 ))
         return samples
 
@@ -248,13 +248,26 @@ class DraytekCollector:
             return parsers.parse_statistic(await s.query("show statistic"))
 
 
-def _series_to_bps(series: list[int]) -> float:
-    """Convert the LATEST sample in a time-series to bits-per-second using
-    the assumed sample interval from settings."""
-    sample = parsers.latest_sample(series)
-    if not settings.traffic_value_is_bytes:
-        return float(sample)
-    return (sample * 8.0) / max(1, settings.traffic_sample_seconds)
+# Bits-per-second conversion factors for each supported `traffic_unit`.
+_UNIT_TO_BPS: dict[str, float] = {
+    "bytes_per_minute": 8.0 / 60.0,
+    "bytes_per_second": 8.0,
+    "bits_per_second": 1.0,
+    "kilobits_per_second": 1000.0,
+    "kilobytes_per_second": 8000.0,
+}
+
+
+def series_to_bps(series: list[int]) -> float:
+    """Convert the most-recent samples of a `show traffic` time-series to
+    bits-per-second, using the configured `traffic_unit`.
+
+    Averages the last `traffic_smoothing_samples` non-zero samples so the
+    displayed rate is less jumpy than reading a single sample.
+    """
+    factor = _UNIT_TO_BPS.get(settings.traffic_unit, 1.0)
+    raw = parsers.smoothed_sample(series, settings.traffic_smoothing_samples)
+    return raw * factor
 
 
 class _MaybeSession:

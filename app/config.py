@@ -1,4 +1,20 @@
+from typing import Literal
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# How to interpret each integer in the `show traffic <ip> tx|rx` time-series.
+# Different DrayTek firmwares emit different units in the same array:
+#   - 2762n (older firmware) — bytes-per-minute aggregate
+#   - 2765 series            — appears to be bits-per-second already
+# Override per-deployment via the TRAFFIC_UNIT env var.
+TrafficUnit = Literal[
+    "bytes_per_minute",   # value * 8 / 60   (2762n default)
+    "bytes_per_second",   # value * 8
+    "bits_per_second",    # value as-is      (likely 2765)
+    "kilobits_per_second",  # value * 1000
+    "kilobytes_per_second",  # value * 8000
+]
 
 
 class Settings(BaseSettings):
@@ -12,15 +28,15 @@ class Settings(BaseSettings):
     # Connect/read timeout for the SSH session, per-command.
     ssh_timeout: float = 15.0
 
-    # Bandwidth time-series interpretation. The Vigor's `show traffic <ip> tx`
-    # returns ~480 historical samples; without a calibration run we assume:
-    #   - the LAST value in the array is the most recent sample
-    #   - each sample is per-minute aggregate bytes
-    # If calibration shows otherwise, flip these without touching parsers.
-    traffic_sample_seconds: int = 60
-    traffic_value_is_bytes: bool = True  # if False, treat as already-bps
+    # Unit of the values inside `show traffic <ip>`. Use /debug/calibrate to
+    # confirm. See TrafficUnit above for the choices.
+    traffic_unit: TrafficUnit = "bits_per_second"
 
-    poll_interval: int = 10
+    # When picking a "current" reading from the time-series, average the
+    # last N non-zero samples. Smooths the otherwise-jumpy display.
+    traffic_smoothing_samples: int = 3
+
+    poll_interval: int = 5
     retention_days: int = 30
 
     db_path: str = "/data/netmon.db"

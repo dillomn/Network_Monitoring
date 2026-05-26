@@ -207,6 +207,24 @@ def latest_sample(series: list[int]) -> int:
     return 0
 
 
+def smoothed_sample(series: list[int], window: int = 3) -> float:
+    """Average the last `window` non-zero samples to get a less jumpy reading.
+
+    If every sample in the trailing window is zero, returns 0. Falls back to
+    latest_sample() behaviour when window <= 1.
+    """
+    if not series:
+        return 0.0
+    if window <= 1:
+        return float(latest_sample(series))
+    tail = series[-max(window * 2, window):]
+    nonzero = [v for v in tail if v > 0]
+    if not nonzero:
+        return 0.0
+    picked = nonzero[-window:]
+    return sum(picked) / len(picked)
+
+
 def parse_statistic(text: str) -> list[WanStat]:
     """`show statistic` -> per-WAN lifetime byte totals.
 

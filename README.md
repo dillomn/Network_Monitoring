@@ -8,7 +8,7 @@ Built and tested against the **Vigor 2762n** and **Vigor 2765 series**. Should w
 
 ## What it does
 
-- Logs into the DrayTek over **SSH** on a schedule (default every 10s)
+- Logs into the DrayTek over **SSH** on a schedule (default every 5s)
 - Runs `srv dhcp status` + `ip arp status` to learn which devices are on-LAN
 - Runs `show traffic <ip> tx|rx` per device to read per-IP bandwidth (the same data the router's Data Flow Monitor displays, but pulled from a stable CLI surface instead of HTML)
 - Stores samples in a local SQLite database (default 30-day retention)
@@ -73,7 +73,7 @@ Open <http://`pi-ip`:8090> in any browser.
 
 A healthy log on startup looks like:
 ```
-INFO draymon: Poller started (router=192.168.1.1 ssh:22 every 10s)
+INFO draymon: Poller started (router=192.168.1.1 ssh:22 every 5s)
 INFO app.poller: Connected to Vigor2762n (firmware 3.9.9.5_MDM1)
 ```
 
@@ -85,8 +85,9 @@ INFO app.poller: Connected to Vigor2762n (firmware 3.9.9.5_MDM1)
 | `ROUTER_SSH_PORT` | `22` | SSH port — must match what you set in *System Maintenance → Management* |
 | `ROUTER_SSH_USER` | `admin` | SSH username |
 | `ROUTER_SSH_PASSWORD` | *(required)* | SSH password. Wrap in single quotes if it contains `$`, `#`, or `!`. |
-| `POLL_INTERVAL` | `10` | Seconds between poll cycles. The router updates internal samples at most every ~minute, so polling faster than 60s mostly costs CPU. |
+| `POLL_INTERVAL` | `5` | Seconds between poll cycles. SSH session is persistent across polls, so 5s is cheap. |
 | `RETENTION_DAYS` | `30` | Days of bandwidth history to keep |
+| `TRAFFIC_UNIT` | `bits_per_second` | How to interpret values from `show traffic <ip>`. See Calibration below for the available units and how to pick one. |
 
 After editing `.env`: `docker compose restart`.
 
@@ -116,18 +117,36 @@ Hit them with `curl -s http://localhost:8090/debug/...`.
 
 ## Calibration (one-time, optional)
 
-The `show traffic <ip> rx` command returns a ~480-value time-series, not a single current rate. The code assumes:
+The `show traffic <ip> rx` command returns a time-series of integers. **The
+unit varies by firmware:**
 
-- the **last** value in the array is the most recent sample, and
-- each sample represents **60 seconds** of bytes (so bps = sample × 8 / 60).
+| Vigor model / firmware  | `TRAFFIC_UNIT` value     |
+|-------------------------|--------------------------|
+| 2762n (original)        | `bytes_per_minute`       |
+| 2765 series             | `bits_per_second` (default) |
+| Other (varies)          | `bytes_per_second`, `kilobits_per_second`, `kilobytes_per_second` |
 
-To confirm both on your firmware, generate steady traffic on one device (`ping -i 0.2 <ip>` from another LAN host) and run:
+### Picking the right unit
+
+1. Find an idle-ish device and one with known traffic (e.g. running a speed test).
+2. Hit `http://<pi-ip>:8090/debug/ssh/raw-traffic?ip=192.168.1.10` — it
+   returns the smoothed raw sample for both TX and RX, plus what every
+   supported unit would compute. Pick the row whose `tx_bps` / `rx_bps`
+   matches the DrayTek's *Diagnostics → Data Flow Monitor* page for the
+   same IP, and set `TRAFFIC_UNIT` to that key in `.env`.
+3. `docker compose restart`.
+
+### Time-series position calibration
+
+The code also assumes the **last** value in the array is the most recent
+sample. To confirm, generate steady traffic on one device and run:
 
 ```bash
 curl 'http://localhost:8090/debug/calibrate?ip=192.168.1.10&wait_s=90'
 ```
 
-The response reports which array positions changed during the wait. If they cluster near the END, the assumption holds. If near the START or scattered, adjust `traffic_sample_seconds` / `traffic_value_is_bytes` in [app/config.py](app/config.py) accordingly.
+The response reports which array positions changed during the wait. If
+they cluster near the END, the assumption holds.
 
 ## Troubleshooting
 
@@ -160,7 +179,13 @@ If it's enabled and `show traffic` still returns all zeros, run the calibration 
 
 ### `show traffic <ip>` numbers don't match the web UI's chart
 
-Run the calibration endpoint. The likely issue is the assumed sample interval (`traffic_sample_seconds` in `config.py`) — DrayTek's chart granularity sometimes varies between firmware builds.
+Hit `/debug/ssh/raw-traffic?ip=<ip>` and compare its `interpretations`
+block to what the DrayTek's *Data Flow Monitor* shows for the same IP.
+Set `TRAFFIC_UNIT` in `.env` to whichever row matches. Symptoms:
+
+- Numbers ~60× too low → you're on `bytes_per_minute` but should be `bytes_per_second`.
+- Numbers ~8× too low → you're on `bytes_per_second` but should be `bits_per_second`.
+- Numbers ~1000× too low → switch to `kilobits_per_second` / `kilobytes_per_second`.
 
 ### WiFi clients don't appear
 
@@ -196,7 +221,7 @@ Data lives in the `draymon_draymon_data` Docker volume (`docker volume inspect d
 | DrayTek Vigor router   |
 | (SSH on :22)           |
 +----------+-------------+
-           ^  SSH session every 10s:
+           ^  SSH session every 5s:
            |  - sys version
            |  - srv dhcp status
            |  - ip arp status

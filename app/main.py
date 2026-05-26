@@ -164,6 +164,48 @@ async def debug_wan() -> JSONResponse:
         raise HTTPException(502, f"{type(e).__name__}: {e}")
 
 
+@app.get("/debug/ssh/raw-traffic")
+async def debug_raw_traffic(ip: str = Query(...)) -> JSONResponse:
+    """Return the raw `show traffic <ip> tx/rx` series plus what each
+    supported unit interpretation would compute for the latest sample.
+    Compare the values to the rate the DrayTek's Data Flow Monitor web UI
+    shows for the same IP — the matching column is your `TRAFFIC_UNIT`."""
+    from .collectors.ssh import _UNIT_TO_BPS, series_to_bps
+    from .parsers.cli import parse_traffic_series, smoothed_sample
+    try:
+        async with DraytekSession() as s:
+            tx_cmd = f"show traffic {ip} tx"
+            rx_cmd = f"show traffic {ip} rx"
+            tx_raw = await s.query(tx_cmd)
+            rx_raw = await s.query(rx_cmd)
+        tx = parse_traffic_series(tx_raw, tx_cmd)
+        rx = parse_traffic_series(rx_raw, rx_cmd)
+        tx_smoothed = smoothed_sample(tx, settings.traffic_smoothing_samples)
+        rx_smoothed = smoothed_sample(rx, settings.traffic_smoothing_samples)
+        interpretations = {
+            unit: {
+                "tx_bps": tx_smoothed * factor,
+                "rx_bps": rx_smoothed * factor,
+            }
+            for unit, factor in _UNIT_TO_BPS.items()
+        }
+        return JSONResponse({
+            "ip": ip,
+            "current_unit": settings.traffic_unit,
+            "current_tx_bps": series_to_bps(tx),
+            "current_rx_bps": series_to_bps(rx),
+            "smoothed_raw_tx": tx_smoothed,
+            "smoothed_raw_rx": rx_smoothed,
+            "tx_series_tail": tx[-20:],
+            "rx_series_tail": rx[-20:],
+            "tx_series_length": len(tx),
+            "rx_series_length": len(rx),
+            "interpretations": interpretations,
+        })
+    except Exception as e:
+        raise HTTPException(502, f"{type(e).__name__}: {e}")
+
+
 @app.get("/debug/calibrate")
 async def debug_calibrate(ip: str = Query(...), wait_s: int = Query(60, ge=10, le=300)) -> JSONResponse:
     """Snapshot `show traffic <ip> rx` twice, `wait_s` apart, return both

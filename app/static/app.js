@@ -11,11 +11,18 @@ const fmtTime = (ts) => {
   return new Date(ts * 1000).toLocaleString();
 };
 
+const escapeHtml = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({
+  "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+}[c]));
+
 let devices = [];
 let mainChart = null;
 let modalChart = null;
 let selectedMac = null;
-let selectedTopN = null;   // when no specific device selected, show this many
+let sortKey = "tx_bps";
+let sortDir = "desc"; // "asc" | "desc"
+
+const SORT_KEYS = new Set(["hostname", "ip", "mac", "tx_bps", "rx_bps"]);
 
 async function fetchJSON(url) {
   const r = await fetch(url);
@@ -52,29 +59,65 @@ async function refreshDevices() {
   }
 }
 
+function sortValue(d, key) {
+  if (key === "hostname") return (d.hostname || "").toLowerCase();
+  if (key === "ip") {
+    // IPv4 numeric sort
+    const parts = (d.ip || "").split(".").map(n => parseInt(n, 10) || 0);
+    return parts[0] * (1 << 24) + parts[1] * (1 << 16) + parts[2] * 256 + parts[3];
+  }
+  if (key === "mac") return (d.mac || "").toLowerCase();
+  return d[key] || 0;
+}
+
+function applySort(rows) {
+  const dir = sortDir === "asc" ? 1 : -1;
+  return rows.slice().sort((a, b) => {
+    const av = sortValue(a, sortKey);
+    const bv = sortValue(b, sortKey);
+    if (av < bv) return -1 * dir;
+    if (av > bv) return 1 * dir;
+    return 0;
+  });
+}
+
+function updateSortIndicators() {
+  document.querySelectorAll("#device-table th.sortable").forEach(th => {
+    const k = th.dataset.sort;
+    const ind = th.querySelector(".sort-ind");
+    if (k === sortKey) {
+      th.classList.add("sorted");
+      ind.textContent = sortDir === "asc" ? "▲" : "▼";
+    } else {
+      th.classList.remove("sorted");
+      ind.textContent = "";
+    }
+  });
+}
+
 function renderDeviceTable() {
   const filter = document.getElementById("filter").value.toLowerCase();
   const tbody = document.querySelector("#device-table tbody");
   const max = Math.max(1, ...devices.map(d => (d.tx_bps || 0) + (d.rx_bps || 0)));
-  const rows = devices
-    .filter(d => {
-      if (!filter) return true;
-      return (d.hostname || "").toLowerCase().includes(filter)
-          || (d.ip || "").includes(filter)
-          || (d.mac || "").toLowerCase().includes(filter)
-          || (d.vendor || "").toLowerCase().includes(filter);
-    })
+  const filtered = devices.filter(d => {
+    if (!filter) return true;
+    return (d.hostname || "").toLowerCase().includes(filter)
+        || (d.ip || "").includes(filter)
+        || (d.mac || "").toLowerCase().includes(filter)
+        || (d.vendor || "").toLowerCase().includes(filter);
+  });
+  const rows = applySort(filtered)
     .map(d => {
       const total = (d.tx_bps || 0) + (d.rx_bps || 0);
-      const barW = Math.min(80, Math.round((total / max) * 80));
-      const name = d.hostname || "(unknown)";
-      const vendor = d.vendor ? `<small>${d.vendor}</small>` : "";
-      return `<tr data-mac="${d.mac}" class="${d.mac === selectedMac ? "active" : ""}">
-        <td><span class="hostname">${name}</span>${vendor}</td>
-        <td class="ip">${d.ip || ""}</td>
-        <td class="mac">${d.mac}</td>
-        <td class="num">${fmtRate(d.tx_bps)}<span class="bar" style="width:${barW}px"></span></td>
-        <td class="num">${fmtRate(d.rx_bps)}</td>
+      const barW = Math.min(60, Math.round((total / max) * 60));
+      const name = escapeHtml(d.hostname || "(unknown)");
+      const vendor = d.vendor ? `<div class="vendor">${escapeHtml(d.vendor)}</div>` : "";
+      return `<tr data-mac="${escapeHtml(d.mac)}" class="${d.mac === selectedMac ? "active" : ""}">
+        <td class="device-cell"><div class="hostname">${name}</div>${vendor}</td>
+        <td class="ip">${escapeHtml(d.ip || "")}</td>
+        <td class="mac">${escapeHtml(d.mac)}</td>
+        <td class="num"><span class="rate">${fmtRate(d.tx_bps)}</span><span class="bar" style="width:${barW}px"></span></td>
+        <td class="num"><span class="rate">${fmtRate(d.rx_bps)}</span></td>
       </tr>`;
     })
     .join("");
@@ -82,6 +125,7 @@ function renderDeviceTable() {
   tbody.querySelectorAll("tr[data-mac]").forEach(tr => {
     tr.addEventListener("click", () => openDeviceModal(tr.dataset.mac));
   });
+  updateSortIndicators();
 }
 
 function chartConfig(label, points) {
@@ -197,6 +241,20 @@ document.getElementById("m-save-note").addEventListener("click", async () => {
   await refreshDevices();
 });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeModal(); });
+
+document.querySelectorAll("#device-table th.sortable").forEach(th => {
+  th.addEventListener("click", () => {
+    const k = th.dataset.sort;
+    if (!SORT_KEYS.has(k)) return;
+    if (sortKey === k) {
+      sortDir = sortDir === "asc" ? "desc" : "asc";
+    } else {
+      sortKey = k;
+      sortDir = (k === "tx_bps" || k === "rx_bps") ? "desc" : "asc";
+    }
+    renderDeviceTable();
+  });
+});
 
 async function tick() {
   await Promise.all([refreshHealth(), refreshDevices()]);

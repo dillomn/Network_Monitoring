@@ -1,0 +1,31 @@
+# Secrets / local config
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# SQLite / data
+*.db
+*.sqlite
+*.sqlite3
+/data/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Diagnostic bundles
+/tmp/draymon-diag-*/
+*draymon-diag-*.tar.gz

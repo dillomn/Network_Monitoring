@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import db, oui
-from .collectors.ssh import DraytekCollector, DraytekSession
+from .collectors.ssh import DraytekSession
 from .config import settings
 from .poller import poller
 
@@ -99,11 +99,12 @@ _DEBUG_CMD_ALLOWLIST = (
 
 @app.get("/debug/ssh/info")
 async def debug_info() -> dict:
-    """Connects, runs `sys version`, returns model/firmware. Sanity check
-    that SSH credentials and the legacy-algorithm list work for your unit."""
-    collector = DraytekCollector()
+    """Run `sys version` over the poller's shared SSH session and return
+    model/firmware. Sanity check that SSH credentials and the legacy-
+    algorithm list work for your unit."""
     try:
-        info = await collector.router_info()
+        async with poller.borrow_session() as s:
+            info = await poller.collector.router_info(s)
         return {"ok": True, "model": info.model, "firmware": info.firmware, "router_name": info.router_name}
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
@@ -111,14 +112,14 @@ async def debug_info() -> dict:
 
 @app.get("/debug/ssh/exec", response_class=PlainTextResponse)
 async def debug_exec(cmd: str = Query(..., min_length=1, max_length=200)) -> str:
-    """Run an arbitrary (allowlisted-prefix) CLI command. Used for ad-hoc
-    inspection of new firmware output. The allowlist is anchored at the
-    *start* of cmd to prevent shell-style command chaining (DrayTek CLI
-    doesn't support `;`/`&&` but we filter anyway as defence in depth)."""
+    """Run an arbitrary (allowlisted-prefix) CLI command on the poller's
+    shared session. The allowlist is anchored at the *start* of cmd to
+    prevent shell-style command chaining (DrayTek CLI doesn't support
+    `;`/`&&` but we filter anyway as defence in depth)."""
     if not any(cmd.startswith(prefix) for prefix in _DEBUG_CMD_ALLOWLIST):
         raise HTTPException(400, f"cmd must start with one of: {_DEBUG_CMD_ALLOWLIST}")
     try:
-        async with DraytekSession() as s:
+        async with poller.borrow_session() as s:
             return await s.query(cmd)
     except Exception as e:
         raise HTTPException(502, f"{type(e).__name__}: {e}")
@@ -127,9 +128,9 @@ async def debug_exec(cmd: str = Query(..., min_length=1, max_length=200)) -> str
 @app.get("/debug/ssh/devices")
 async def debug_devices() -> JSONResponse:
     """Parsed device list straight from SSH (no DB)."""
-    collector = DraytekCollector()
     try:
-        devs = await collector.devices()
+        async with poller.borrow_session() as s:
+            devs = await poller.collector.devices(s)
         return JSONResponse([vars(d) for d in devs])
     except Exception as e:
         raise HTTPException(502, f"{type(e).__name__}: {e}")
@@ -139,16 +140,15 @@ async def debug_devices() -> JSONResponse:
 async def debug_flow(ip: str | None = Query(None)) -> JSONResponse:
     """Per-IP bandwidth as the collector sees it. If `ip` is given, polls
     just that IP; otherwise discovers devices first then polls all."""
-    collector = DraytekCollector()
     try:
-        async with DraytekSession() as s:
+        async with poller.borrow_session() as s:
             if ip:
                 ips = [ip]
             else:
-                devs = await collector.devices(s)
+                devs = await poller.collector.devices(s)
                 ips = [d.ip for d in devs if d.ip]
-            samples = await collector.flow(ips, s)
-        return JSONResponse([vars(s) for s in samples])
+            samples = await poller.collector.flow(ips, s)
+        return JSONResponse([vars(sample) for sample in samples])
     except Exception as e:
         raise HTTPException(502, f"{type(e).__name__}: {e}")
 
@@ -156,10 +156,10 @@ async def debug_flow(ip: str | None = Query(None)) -> JSONResponse:
 @app.get("/debug/ssh/wan")
 async def debug_wan() -> JSONResponse:
     """Per-WAN lifetime byte counters from `show statistic`."""
-    collector = DraytekCollector()
     try:
-        stats = await collector.wan_totals()
-        return JSONResponse([vars(s) for s in stats])
+        async with poller.borrow_session() as s:
+            stats = await poller.collector.wan_totals(s)
+        return JSONResponse([vars(stat) for stat in stats])
     except Exception as e:
         raise HTTPException(502, f"{type(e).__name__}: {e}")
 
@@ -173,7 +173,7 @@ async def debug_raw_traffic(ip: str = Query(...)) -> JSONResponse:
     from .collectors.ssh import _UNIT_TO_BPS, series_to_bps
     from .parsers.cli import parse_traffic_series, smoothed_sample
     try:
-        async with DraytekSession() as s:
+        async with poller.borrow_session() as s:
             tx_cmd = f"show traffic {ip} tx"
             rx_cmd = f"show traffic {ip} rx"
             tx_raw = await s.query(tx_cmd)
@@ -210,8 +210,9 @@ async def debug_raw_traffic(ip: str = Query(...)) -> JSONResponse:
 async def debug_calibrate(ip: str = Query(...), wait_s: int = Query(60, ge=10, le=300)) -> JSONResponse:
     """Snapshot `show traffic <ip> rx` twice, `wait_s` apart, return both
     plus a diff so we can see which positions in the time-series moved and
-    in which direction. Use to verify the 'last sample = newest' and
-    sample-interval assumptions baked into the parser."""
+    in which direction. Note: this command opens its OWN session (not the
+    poller's) since it holds for `wait_s` seconds — we don't want to block
+    the poll loop that long."""
     import asyncio
     from .parsers.cli import parse_traffic_series
     cmd = f"show traffic {ip} rx"

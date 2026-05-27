@@ -30,13 +30,13 @@ class Settings(BaseSettings):
 
     # Unit of the values inside `show traffic <ip>`. Use /debug/calibrate to
     # confirm. See TrafficUnit above for the choices.
-    traffic_unit: TrafficUnit = "bits_per_second"
+    traffic_unit: TrafficUnit = "kilobits_per_second"
 
     # When picking a "current" reading from the time-series, average the
     # last N non-zero samples. Smooths the otherwise-jumpy display.
     traffic_smoothing_samples: int = 3
 
-    poll_interval: int = 5
+    poll_interval: int = 1
     retention_days: int = 30
 
     db_path: str = "/data/netmon.db"

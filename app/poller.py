@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
 
 import asyncssh
 
@@ -33,6 +34,10 @@ class Poller:
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._session: DraytekSession | None = None
+        # Serialises access to the single SSH session. DrayTek embedded
+        # SSH stacks misbehave under concurrent connections — keep it to one
+        # session, taken in turn by the poller and any debug endpoints.
+        self._session_lock = asyncio.Lock()
 
     async def start(self) -> None:
         db.init_db()
@@ -42,7 +47,8 @@ class Poller:
         self._stop.set()
         if self._task:
             await self._task
-        await self._drop_session()
+        async with self._session_lock:
+            await self._drop_session()
 
     async def _ensure_session(self) -> DraytekSession:
         if self._session is None:
@@ -51,6 +57,22 @@ class Poller:
             self._session = s
             log.info("SSH session opened to %s:%s", settings.router_host, settings.router_ssh_port)
         return self._session
+
+    @asynccontextmanager
+    async def borrow_session(self):
+        """Lend the poller's SSH session to ad-hoc callers (e.g. debug
+        endpoints). Blocks the poll loop while held; release quickly.
+
+        If the session is broken when we release, it's dropped so the next
+        poll reconnects.
+        """
+        async with self._session_lock:
+            try:
+                session = await self._ensure_session()
+                yield session
+            except _TRANSPORT_ERRORS:
+                await self._drop_session()
+                raise
 
     async def _drop_session(self) -> None:
         """Close and discard the cached session. Safe to call even if the
@@ -68,7 +90,8 @@ class Poller:
         prune_counter = 0
         while not self._stop.is_set():
             try:
-                await self._poll_once()
+                async with self._session_lock:
+                    await self._poll_once()
                 self.last_poll_ok = True
                 self.last_error = None
             except _TRANSPORT_ERRORS as e:
@@ -77,7 +100,8 @@ class Poller:
                 self.last_poll_ok = False
                 self.last_error = f"{type(e).__name__}: {e}"
                 log.warning("Poll failed (transport): %s — will reconnect next cycle", self.last_error)
-                await self._drop_session()
+                async with self._session_lock:
+                    await self._drop_session()
             except Exception as e:
                 # Non-transport failure (parser, DB, etc.) — the SSH session
                 # is probably fine; keep it and just log.

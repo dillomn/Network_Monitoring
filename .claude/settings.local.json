@@ -18,7 +18,15 @@
       "Bash(py -c \"import ast; [ast.parse\\(open\\(p\\).read\\(\\)\\) for p in ['app/config.py','app/main.py','app/poller.py','app/collectors/ssh.py','app/parsers/cli.py']]; print\\('all parse OK'\\)\")",
       "Bash(python3 -c \"import ast; [ast.parse\\(open\\(p\\).read\\(\\)\\) for p in ['app/config.py','app/main.py','app/poller.py','app/collectors/ssh.py','app/parsers/cli.py']]; print\\('all parse OK'\\)\")",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "WebSearch",
+      "WebFetch(domain:www.draytek.co.uk)",
+      "WebFetch(domain:www.i-lan.net.au)",
+      "Bash(ls /c/Users/DillonBrooks/.claude/projects/c--Users-DillonBrooks-CCTS-Shared---Documents-0--Internal-CCTS-SD-Technicians-AutomatedSlaveSuite-Docker-Network-Monitoring/f3e3dc28-8ef7-41c5-9a55-98abb3f79396/tool-results/ 2>/dev/null | head)",
+      "Read(//c/Users/DillonBrooks/.claude/projects/c--Users-DillonBrooks-CCTS-Shared---Documents-0--Internal-CCTS-SD-Technicians-AutomatedSlaveSuite-Docker-Network-Monitoring/f3e3dc28-8ef7-41c5-9a55-98abb3f79396/tool-results//**)",
+      "WebFetch(domain:whirlpool.net.au)",
+      "WebFetch(domain:www.draytek.com)",
+      "WebFetch(domain:www.manualslib.com)"
     ],
     "additionalDirectories": [
       "c:\\Users\\DillonBrooks\\CCTS\\Shared - Documents\\Team\\SD Technicians\\AutomatedSlaveSuite\\Docker\\Network_Monitoring\\prometheus"

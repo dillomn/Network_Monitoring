@@ -43,20 +43,29 @@ main {
 }
 
 table { width: 100%; border-collapse: collapse; table-layout: fixed; }
-.col-device { width: 26%; }
-.col-ip { width: 18%; }
+.col-device { width: 24%; }
+.col-ip { width: 16%; }
 .col-mac { width: 22%; }
-.col-rate { width: 17%; }
+.col-rate { width: 19%; }
 thead th {
   position: sticky; top: 0; background: var(--panel-2); text-align: left;
   font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
   color: var(--muted); padding: 8px 10px; border-bottom: 1px solid var(--border);
-  white-space: nowrap;
+  white-space: nowrap; overflow: hidden;
 }
+thead th.num { text-align: right; }
 thead th.sortable { cursor: pointer; user-select: none; }
 thead th.sortable:hover { color: var(--text); background: #232b35; }
 thead th.sorted { color: var(--text); }
-thead th .sort-ind { display: inline-block; margin-left: 4px; font-size: 9px; color: var(--accent); }
+thead th.sortable .label { display: inline-block; }
+thead th .parens {
+  font-size: 9px; text-transform: none; font-weight: normal;
+  opacity: 0.65; margin-left: 2px; letter-spacing: 0;
+}
+thead th .sort-ind {
+  display: inline-block; width: 10px; margin-left: 4px;
+  font-size: 9px; color: var(--accent); text-align: center;
+}
 tbody { display: block; max-height: 100%; overflow: auto; }
 thead, tbody tr { display: table; width: 100%; table-layout: fixed; }
 .devices table { display: block; height: 100%; }

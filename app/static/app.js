@@ -32,11 +32,18 @@ async function fetchJSON(url) {
 
 async function refreshHealth() {
   try {
-    const h = await fetchJSON("/api/health");
+    const [h, wan] = await Promise.all([
+      fetchJSON("/api/health"),
+      fetchJSON("/api/wan/current").catch(() => []),
+    ]);
     const el = document.getElementById("health");
     const age = h.last_poll_age_s;
+    const wanStr = wan.length
+      ? wan.map(w => `${w.wan} ↑ ${fmtRate(w.tx_bps)} ↓ ${fmtRate(w.rx_bps)}`).join(" • ")
+      : "";
     if (h.last_poll_ok && age !== null && age < h.poll_interval_s * 3) {
-      el.textContent = `router ${h.router} • last poll ${age}s ago`;
+      const wanSuffix = wanStr ? `<span class="wan-live">${wanStr}</span>` : "";
+      el.innerHTML = `router ${escapeHtml(h.router)} • last poll ${age}s ago${wanSuffix ? " • " + wanSuffix : ""}`;
       el.className = "health ok";
     } else if (h.last_error) {
       el.textContent = `error: ${h.last_error}`;

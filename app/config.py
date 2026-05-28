@@ -33,8 +33,11 @@ class Settings(BaseSettings):
     traffic_unit: TrafficUnit = "kilobits_per_second"
 
     # When picking a "current" reading from the time-series, average the
-    # last N non-zero samples. Smooths the otherwise-jumpy display.
-    traffic_smoothing_samples: int = 3
+    # last N non-zero samples in the buffer. Default 1 = no averaging
+    # (use the latest sample directly). Higher values flatten spikes
+    # because each buffer position already represents a ~10s window on
+    # the router side — averaging across positions stacks that window.
+    traffic_smoothing_samples: int = 1
 
     poll_interval: int = 1
     retention_days: int = 30

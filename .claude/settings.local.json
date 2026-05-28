@@ -26,7 +26,8 @@
       "Read(//c/Users/DillonBrooks/.claude/projects/c--Users-DillonBrooks-CCTS-Shared---Documents-0--Internal-CCTS-SD-Technicians-AutomatedSlaveSuite-Docker-Network-Monitoring/f3e3dc28-8ef7-41c5-9a55-98abb3f79396/tool-results//**)",
       "WebFetch(domain:whirlpool.net.au)",
       "WebFetch(domain:www.draytek.com)",
-      "WebFetch(domain:www.manualslib.com)"
+      "WebFetch(domain:www.manualslib.com)",
+      "WebFetch(domain:forums.whirlpool.net.au)"
     ],
     "additionalDirectories": [
       "c:\\Users\\DillonBrooks\\CCTS\\Shared - Documents\\Team\\SD Technicians\\AutomatedSlaveSuite\\Docker\\Network_Monitoring\\prometheus"

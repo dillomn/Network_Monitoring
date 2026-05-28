@@ -61,6 +61,20 @@ async def health() -> dict:
     }
 
 
+@app.get("/api/wan/current")
+async def wan_current() -> list[dict]:
+    """Latest tx_bps/rx_bps per WAN, derived from `show statistic` byte
+    deltas between polls. Independent of per-IP `show traffic` buffer."""
+    return db.list_wan_current()
+
+
+@app.get("/api/wan/history")
+async def wan_history_api(wan: str = Query(...), hours: int = Query(24, ge=1, le=24 * 30)) -> dict:
+    since = int(time.time()) - hours * 3600
+    points = db.wan_history(wan.upper(), since)
+    return {"wan": wan.upper(), "since": since, "points": points}
+
+
 @app.get("/api/devices")
 async def devices() -> list[dict]:
     rows = db.list_devices_with_current()

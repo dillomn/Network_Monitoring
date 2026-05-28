@@ -9,8 +9,9 @@ Built and tested against the **Vigor 2762n** and **Vigor 2765 series**.
 - Logs into the DrayTek over SSH (default every 1s)
 - Reads `srv dhcp status` + `ip arp status` for the device list
 - Reads `show traffic <ip> tx|rx` per device for live bandwidth
+- Reads `show statistic` and computes live per-WAN bps from byte-counter deltas between polls
 - Stores samples in SQLite (default 30-day retention)
-- Web UI at `http://<pi-ip>:8090` with a sortable device list and historical graphs
+- Web UI at `http://<pi-ip>:8090` with a sortable device list, live WAN totals, and historical graphs
 
 ## Prerequisites
 

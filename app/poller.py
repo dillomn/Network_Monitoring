@@ -38,6 +38,11 @@ class Poller:
         # SSH stacks misbehave under concurrent connections — keep it to one
         # session, taken in turn by the poller and any debug endpoints.
         self._session_lock = asyncio.Lock()
+        # Cumulative WAN byte counters from the previous poll, keyed by
+        # wan name. Used to compute live bps from `show statistic` deltas.
+        self._last_wan_tx: dict[str, int] = {}
+        self._last_wan_rx: dict[str, int] = {}
+        self._last_wan_ts: int = 0
 
     async def start(self) -> None:
         db.init_db()
@@ -157,6 +162,45 @@ class Poller:
             db.insert_sample(mac, f.tx_bps, f.rx_bps, f.sessions)
 
         self.last_device_count = len(devices)
+
+        await self._update_wan_rate(session)
+
+    async def _update_wan_rate(self, session: DraytekSession) -> None:
+        """Read cumulative WAN byte counters and persist the bps delta
+        against the previous reading. Independent of the per-IP buffer,
+        so this is a true near-instantaneous rate at our poll cadence.
+
+        Skips a sample if the counter went backwards (router reboot, or
+        32-bit wrap on a fast link). We could reconstruct around wrap,
+        but a one-poll gap is harmless for a chart."""
+        try:
+            wan_now = await self.collector.wan_totals(session)
+        except Exception:
+            log.exception("WAN totals query failed")
+            return
+        ts_now = int(time.time())
+        # Only track WANs that have ever shown traffic — the router reports
+        # all 6 WAN slots even when only one is wired up, and we don't want
+        # five rows of "WAN3 ↑0bps ↓0bps" in the UI.
+        active = [w for w in wan_now if w.tx_bytes > 0 or w.rx_bytes > 0]
+        if self._last_wan_ts:
+            elapsed = max(1, ts_now - self._last_wan_ts)
+            for w in active:
+                prev_tx = self._last_wan_tx.get(w.wan)
+                prev_rx = self._last_wan_rx.get(w.wan)
+                if prev_tx is None or prev_rx is None:
+                    continue
+                dtx = w.tx_bytes - prev_tx
+                drx = w.rx_bytes - prev_rx
+                if dtx < 0 or drx < 0:
+                    log.debug("WAN %s counter went backwards (tx %d->%d, rx %d->%d); skipping",
+                              w.wan, prev_tx, w.tx_bytes, prev_rx, w.rx_bytes)
+                    continue
+                db.insert_wan_sample(w.wan, (dtx * 8) / elapsed, (drx * 8) / elapsed)
+        for w in active:
+            self._last_wan_tx[w.wan] = w.tx_bytes
+            self._last_wan_rx[w.wan] = w.rx_bytes
+        self._last_wan_ts = ts_now
 
 
 poller = Poller()

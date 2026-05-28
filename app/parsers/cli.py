@@ -228,11 +228,49 @@ def smoothed_sample(series: list[int], window: int = 3) -> float:
 def parse_statistic(text: str) -> list[WanStat]:
     """`show statistic` -> per-WAN lifetime byte totals.
 
+    DrayTek prints with a human-readable unit, NOT raw bytes:
         WAN1 total TX: 0 Bytes ,RX: 0 Bytes
+        WAN2 total TX: 7.4 GB ,RX: 53.8 GB
+        WAN3 total TX: 5.2 MB ,RX: 1.5 KB
+
+    Decimal precision (e.g. "0.1 GB") puts a floor on the smallest delta
+    we can observe between polls — ~100 MB at the GB scale. That's fine
+    for "what's hogging the WAN"; less so for monitoring trickle traffic.
     """
+    pat = re.compile(
+        r"(WAN\d+)\s+total\s+TX:\s*([\d.]+)\s*([A-Za-z]+)"
+        r"\s*,\s*RX:\s*([\d.]+)\s*([A-Za-z]+)",
+        re.IGNORECASE,
+    )
     out: list[WanStat] = []
     for line in text.splitlines():
-        m = re.search(r"(WAN\d+)\s+total\s+TX:\s*(\d+)\s*Bytes\s*,\s*RX:\s*(\d+)\s*Bytes", line, re.IGNORECASE)
-        if m:
-            out.append(WanStat(wan=m.group(1).upper(), tx_bytes=int(m.group(2)), rx_bytes=int(m.group(3))))
+        m = pat.search(line)
+        if not m:
+            continue
+        wan = m.group(1).upper()
+        tx = _bytes_from_unit(m.group(2), m.group(3))
+        rx = _bytes_from_unit(m.group(4), m.group(5))
+        if tx is None or rx is None:
+            continue  # unrecognised unit — log silently, don't crash
+        out.append(WanStat(wan=wan, tx_bytes=tx, rx_bytes=rx))
     return out
+
+
+# SI multipliers — DrayTek uses 1000-based units in `show statistic`.
+_BYTE_UNIT_MULTIPLIERS: dict[str, int] = {
+    "B": 1, "BYTES": 1,
+    "KB": 1_000,
+    "MB": 1_000_000,
+    "GB": 1_000_000_000,
+    "TB": 1_000_000_000_000,
+}
+
+
+def _bytes_from_unit(num: str, unit: str) -> int | None:
+    factor = _BYTE_UNIT_MULTIPLIERS.get(unit.upper())
+    if factor is None:
+        return None
+    try:
+        return int(float(num) * factor)
+    except ValueError:
+        return None

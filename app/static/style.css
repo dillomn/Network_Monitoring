@@ -23,6 +23,7 @@ header h1 { font-size: 16px; margin: 0; letter-spacing: 0.02em; }
 .health { font-size: 12px; color: var(--muted); }
 .health.ok { color: var(--good); }
 .health.bad { color: var(--bad); }
+.wan-live { color: var(--text); font-variant-numeric: tabular-nums; }
 
 main {
   display: grid;

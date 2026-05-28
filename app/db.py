@@ -26,8 +26,20 @@ CREATE TABLE IF NOT EXISTS samples (
     sessions INTEGER
 );
 
+-- Per-WAN rate computed from cumulative byte-counter deltas in
+-- `show statistic` between polls — independent of the per-IP buffer.
+CREATE TABLE IF NOT EXISTS wan_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    wan TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    tx_bps REAL NOT NULL,
+    rx_bps REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_samples_mac_ts ON samples(mac, ts);
 CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(ts);
+CREATE INDEX IF NOT EXISTS idx_wan_samples_wan_ts ON wan_samples(wan, ts);
+CREATE INDEX IF NOT EXISTS idx_wan_samples_ts ON wan_samples(ts);
 """
 
 
@@ -101,10 +113,44 @@ def history_for(mac: str, since_ts: int) -> list[dict]:
 def prune_old_samples(retention_days: int) -> int:
     cutoff = int(time.time()) - retention_days * 86400
     with conn() as c:
-        cur = c.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
-        return cur.rowcount
+        a = c.execute("DELETE FROM samples WHERE ts < ?", (cutoff,)).rowcount
+        b = c.execute("DELETE FROM wan_samples WHERE ts < ?", (cutoff,)).rowcount
+        return a + b
 
 
 def set_device_note(mac: str, note: str) -> None:
     with conn() as c:
         c.execute("UPDATE devices SET notes = ? WHERE mac = ?", (note, mac))
+
+
+def insert_wan_sample(wan: str, tx_bps: float, rx_bps: float) -> None:
+    with conn() as c:
+        c.execute(
+            "INSERT INTO wan_samples (wan, ts, tx_bps, rx_bps) VALUES (?, ?, ?, ?)",
+            (wan, int(time.time()), tx_bps, rx_bps),
+        )
+
+
+def list_wan_current() -> list[dict]:
+    """Latest tx_bps/rx_bps per WAN."""
+    with conn() as c:
+        rows = c.execute(
+            """
+            SELECT wans.wan,
+                   (SELECT tx_bps FROM wan_samples w WHERE w.wan = wans.wan ORDER BY ts DESC LIMIT 1) AS tx_bps,
+                   (SELECT rx_bps FROM wan_samples w WHERE w.wan = wans.wan ORDER BY ts DESC LIMIT 1) AS rx_bps,
+                   (SELECT ts     FROM wan_samples w WHERE w.wan = wans.wan ORDER BY ts DESC LIMIT 1) AS ts
+            FROM (SELECT DISTINCT wan FROM wan_samples) wans
+            ORDER BY wans.wan
+            """
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def wan_history(wan: str, since_ts: int) -> list[dict]:
+    with conn() as c:
+        rows = c.execute(
+            "SELECT ts, tx_bps, rx_bps FROM wan_samples WHERE wan = ? AND ts >= ? ORDER BY ts ASC",
+            (wan, since_ts),
+        ).fetchall()
+    return [dict(r) for r in rows]

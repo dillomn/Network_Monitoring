@@ -6,6 +6,22 @@ const fmtRate = (bps) => {
   return `${bps.toFixed(bps >= 100 ? 0 : bps >= 10 ? 1 : 2)} ${units[i]}`;
 };
 
+// Pick one bandwidth unit for an entire chart axis based on the data's
+// peak — keeps the Y axis from flickering between Kbps and Mbps as new
+// samples come in. Returns {divisor, label}.
+const pickAxisUnit = (maxBps) => {
+  if (maxBps >= 1e9) return { divisor: 1e9, label: "Gbps" };
+  if (maxBps >= 1e6) return { divisor: 1e6, label: "Mbps" };
+  if (maxBps >= 1e3) return { divisor: 1e3, label: "Kbps" };
+  return { divisor: 1, label: "bps" };
+};
+
+const fmtRateInUnit = (bps, unit) => {
+  const v = (bps || 0) / unit.divisor;
+  const digits = v >= 100 ? 0 : v >= 10 ? 1 : 2;
+  return `${v.toFixed(digits)} ${unit.label}`;
+};
+
 const fmtTime = (ts) => {
   if (!ts) return "—";
   return new Date(ts * 1000).toLocaleString();
@@ -136,6 +152,8 @@ function renderDeviceTable() {
 }
 
 function chartConfig(label, points) {
+  const peak = points.reduce((m, p) => Math.max(m, p.tx_bps || 0, p.rx_bps || 0), 0);
+  const yUnit = pickAxisUnit(peak);
   return {
     type: "line",
     data: {
@@ -161,7 +179,8 @@ function chartConfig(label, points) {
       scales: {
         x: { type: "time", time: { tooltipFormat: "MMM d, HH:mm:ss" },
              ticks: { color: "#8a96a4" }, grid: { color: "rgba(255,255,255,0.05)" } },
-        y: { ticks: { color: "#8a96a4", callback: (v) => fmtRate(v) },
+        y: { ticks: { color: "#8a96a4", callback: (v) => fmtRateInUnit(v, yUnit) },
+             title: { display: true, text: yUnit.label, color: "#8a96a4" },
              grid: { color: "rgba(255,255,255,0.05)" }, beginAtZero: true },
       },
       plugins: {

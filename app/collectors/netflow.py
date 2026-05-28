@@ -59,6 +59,10 @@ class NetflowCollector:
         self._flush_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._port: int | None = None
+        # Ring buffer of the most recently parsed flow records — exposed
+        # via /api/netflow/recent so we can see what the router is sending.
+        self._recent: list[dict] = []
+        self._recent_max: int = 200
         # diagnostics
         self.packets_received: int = 0
         self.records_processed: int = 0
@@ -108,13 +112,29 @@ class NetflowCollector:
             return
         src_local = _is_private(rec.src)
         dst_local = _is_private(rec.dst)
+        direction: str
         if src_local and not dst_local:
             self._tx_bytes[rec.src] = self._tx_bytes.get(rec.src, 0) + total
             self.records_processed += 1
+            direction = "tx"
         elif dst_local and not src_local:
             self._rx_bytes[rec.dst] = self._rx_bytes.get(rec.dst, 0) + total
             self.records_processed += 1
-        # LAN↔LAN and WAN↔WAN: not relevant for "who's hogging the internet".
+            direction = "rx"
+        else:
+            return  # LAN↔LAN or WAN↔WAN: not internet bandwidth
+        # Stash for diagnostics — bounded ring buffer.
+        self._recent.append({
+            "ts": self.last_packet_ts,
+            "direction": direction,
+            "src": rec.src, "dst": rec.dst,
+            "src_port": rec.src_port, "dst_port": rec.dst_port,
+            "proto": rec.protocol,
+            "in_bytes": rec.in_bytes, "out_bytes": rec.out_bytes,
+            "in_pkts": rec.in_packets, "out_pkts": rec.out_packets,
+        })
+        if len(self._recent) > self._recent_max:
+            del self._recent[:len(self._recent) - self._recent_max]
 
     async def _flush_loop(self) -> None:
         while not self._stop.is_set():
@@ -155,6 +175,13 @@ class NetflowCollector:
             "buffered_ips_tx": len(self._tx_bytes),
             "buffered_ips_rx": len(self._rx_bytes),
         }
+
+    def recent(self, limit: int = 50) -> list[dict]:
+        """Last N parsed flow records — for diagnosing 'is the router
+        sending what we expect' questions without tcpdump."""
+        if limit <= 0:
+            return []
+        return list(self._recent[-limit:])
 
 
 netflow = NetflowCollector()

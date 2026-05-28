@@ -78,6 +78,14 @@ async def netflow_stats_api() -> dict:
     return netflow.stats()
 
 
+@app.get("/api/netflow/recent")
+async def netflow_recent_api(limit: int = Query(50, ge=1, le=200)) -> list[dict]:
+    """Most recent N parsed NetFlow records. Useful when device totals
+    look wrong — shows exactly what the router is sending (direction,
+    src/dst, byte counts) so you can verify the attribution logic."""
+    return netflow.recent(limit)
+
+
 @app.get("/api/wan/current")
 async def wan_current() -> list[dict]:
     """Latest tx_bps/rx_bps per WAN, derived from `show statistic` byte

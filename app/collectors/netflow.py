@@ -66,6 +66,13 @@ class NetflowCollector:
         self._templates: dict[int, list] = {}
         self._tx_bytes: dict[str, int] = {}
         self._rx_bytes: dict[str, int] = {}
+        # Sum of flow durations (FIRST_SWITCHED↔LAST_SWITCHED) per MAC
+        # since last flush. Used as the denominator so rate = real_bytes /
+        # real_seconds, not bytes / our-arbitrary-flush-window. Without
+        # this, a 60s flow record arriving in a 5s flush window reports
+        # as 12× the real rate (or a cancel-burst dumps ~all bytes at
+        # flush-window resolution → 100+ Mbps fake spikes).
+        self._duration_s: dict[str, float] = {}
         self._last_flush: float = 0.0
         self._transport: asyncio.DatagramTransport | None = None
         self._flush_task: asyncio.Task | None = None
@@ -145,17 +152,26 @@ class NetflowCollector:
             rx_add = rec.in_bytes   # LAN received
         else:
             return  # LAN↔LAN or WAN↔WAN: not internet bandwidth
+        # How long the bytes in this flow actually took to happen, per the
+        # router's own clock. Zero/missing means we'll fall back to the
+        # flush-window estimate at flush time.
+        duration_s = 0.0
+        if rec.last_switched > rec.first_switched > 0:
+            duration_s = (rec.last_switched - rec.first_switched) / 1000.0
         if mac is not None:
             if tx_add > 0:
                 self._tx_bytes[mac] = self._tx_bytes.get(mac, 0) + tx_add
             if rx_add > 0:
                 self._rx_bytes[mac] = self._rx_bytes.get(mac, 0) + rx_add
+            if duration_s > 0 and (tx_add > 0 or rx_add > 0):
+                self._duration_s[mac] = self._duration_s.get(mac, 0.0) + duration_s
             self.records_processed += 1
         # Stash for diagnostics — bounded ring buffer.
         self._recent.append({
             "ts": self.last_packet_ts,
             "mac": mac,
             "tx_add": tx_add, "rx_add": rx_add,
+            "duration_s": duration_s,
             "src": rec.src, "dst": rec.dst,
             "src_mac": rec.src_mac, "dst_mac": rec.dst_mac,
             "src_port": rec.src_port, "dst_port": rec.dst_port,
@@ -190,7 +206,7 @@ class NetflowCollector:
 
     def _flush(self) -> None:
         now = time.monotonic()
-        elapsed = max(0.5, now - self._last_flush)
+        flush_window = max(0.5, now - self._last_flush)
         self._last_flush = now
         # Drop the IP→MAC cache periodically so DHCP changes get picked up.
         if now >= self._cache_expires_at:
@@ -200,7 +216,13 @@ class NetflowCollector:
         for mac in macs:
             tx = self._tx_bytes.pop(mac, 0)
             rx = self._rx_bytes.pop(mac, 0)
-            db.insert_sample(mac, (tx * 8) / elapsed, (rx * 8) / elapsed)
+            d = self._duration_s.pop(mac, 0.0)
+            # Use the flow's own duration when the router gave us
+            # FIRST/LAST_SWITCHED; fall back to our flush window if it
+            # didn't (older NetFlow exporters, or records arrived with
+            # equal first==last meaning a "zero-duration" flow).
+            divisor = d if d > 0 else flush_window
+            db.insert_sample(mac, (tx * 8) / divisor, (rx * 8) / divisor)
 
     def stats(self) -> dict:
         return {

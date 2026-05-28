@@ -18,27 +18,39 @@ import time
 from ipaddress import ip_address, ip_network
 
 from .. import db
+from ..config import settings
 from ..parsers.netflow import FlowRecord, parse_packet
 
 log = logging.getLogger(__name__)
 
-# RFC1918 — what we treat as LAN for attribution.
-_PRIVATE_NETS = [
-    ip_network("10.0.0.0/8"),
-    ip_network("172.16.0.0/12"),
-    ip_network("192.168.0.0/16"),
-]
+# Configured LAN prefixes — parsed once on module import. Bad entries are
+# logged and skipped rather than crashing startup.
+def _parse_lan_prefixes() -> list:
+    out = []
+    for raw in settings.lan_prefixes.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            out.append(ip_network(raw))
+        except ValueError as e:
+            log.warning("LAN_PREFIXES: ignoring bad entry %r (%s)", raw, e)
+    return out
+
+
+_LAN_NETS = _parse_lan_prefixes()
 
 # How often the in-memory byte accumulators are converted to bps and
 # written to SQLite. Lower = livelier UI but more DB churn.
 FLUSH_INTERVAL_S = 5.0
 
 
-def _is_private(ip: str) -> bool:
+def _is_lan(ip: str) -> bool:
     try:
-        return any(ip_address(ip) in net for net in _PRIVATE_NETS)
+        addr = ip_address(ip)
     except ValueError:
         return False
+    return any(addr in net for net in _LAN_NETS)
 
 
 class _Protocol(asyncio.DatagramProtocol):
@@ -63,6 +75,10 @@ class NetflowCollector:
         # via /api/netflow/recent so we can see what the router is sending.
         self._recent: list[dict] = []
         self._recent_max: int = 200
+        # IP→MAC cache. Refreshed every 30s in the flush loop so we don't
+        # do a SQLite query per flow record. Negative results are cached.
+        self._ip_mac_cache: dict[str, str | None] = {}
+        self._cache_expires_at: float = 0.0
         # diagnostics
         self.packets_received: int = 0
         self.records_processed: int = 0
@@ -107,27 +123,41 @@ class NetflowCollector:
     def _attribute(self, rec: FlowRecord) -> None:
         if rec.src is None or rec.dst is None:
             return
-        total = rec.in_bytes + rec.out_bytes
-        if total <= 0:
+        if rec.in_bytes <= 0 and rec.out_bytes <= 0:
             return
-        src_local = _is_private(rec.src)
-        dst_local = _is_private(rec.dst)
-        direction: str
+        src_local = _is_lan(rec.src)
+        dst_local = _is_lan(rec.dst)
+        # Split in_bytes and out_bytes into TX/RX based on which end is
+        # the LAN device. The DrayTek 2765 emits "biflow" records — one
+        # record per connection with `in_bytes` = src→dst direction and
+        # `out_bytes` = dst→src direction. For uniflow routers `out_bytes`
+        # is just 0 and only `in_bytes` carries data; same logic works.
+        tx_add = 0
+        rx_add = 0
+        mac: str | None
         if src_local and not dst_local:
-            self._tx_bytes[rec.src] = self._tx_bytes.get(rec.src, 0) + total
-            self.records_processed += 1
-            direction = "tx"
+            mac = rec.src_mac or self._mac_for_ip(rec.src)
+            tx_add = rec.in_bytes   # LAN sent → upload
+            rx_add = rec.out_bytes  # LAN received → download
         elif dst_local and not src_local:
-            self._rx_bytes[rec.dst] = self._rx_bytes.get(rec.dst, 0) + total
-            self.records_processed += 1
-            direction = "rx"
+            mac = rec.dst_mac or self._mac_for_ip(rec.dst)
+            tx_add = rec.out_bytes  # LAN sent (reverse direction)
+            rx_add = rec.in_bytes   # LAN received
         else:
             return  # LAN↔LAN or WAN↔WAN: not internet bandwidth
+        if mac is not None:
+            if tx_add > 0:
+                self._tx_bytes[mac] = self._tx_bytes.get(mac, 0) + tx_add
+            if rx_add > 0:
+                self._rx_bytes[mac] = self._rx_bytes.get(mac, 0) + rx_add
+            self.records_processed += 1
         # Stash for diagnostics — bounded ring buffer.
         self._recent.append({
             "ts": self.last_packet_ts,
-            "direction": direction,
+            "mac": mac,
+            "tx_add": tx_add, "rx_add": rx_add,
             "src": rec.src, "dst": rec.dst,
+            "src_mac": rec.src_mac, "dst_mac": rec.dst_mac,
             "src_port": rec.src_port, "dst_port": rec.dst_port,
             "proto": rec.protocol,
             "in_bytes": rec.in_bytes, "out_bytes": rec.out_bytes,
@@ -135,6 +165,16 @@ class NetflowCollector:
         })
         if len(self._recent) > self._recent_max:
             del self._recent[:len(self._recent) - self._recent_max]
+
+    def _mac_for_ip(self, ip: str) -> str | None:
+        """Cached IP→MAC lookup. Cache is cleared every 30s in _flush() so
+        new DHCP leases get picked up. Negative results are cached too —
+        a flood of records for an unknown IP shouldn't hammer SQLite."""
+        if ip in self._ip_mac_cache:
+            return self._ip_mac_cache[ip]
+        mac = db.mac_for_ip(ip)
+        self._ip_mac_cache[ip] = mac
+        return mac
 
     async def _flush_loop(self) -> None:
         while not self._stop.is_set():
@@ -152,15 +192,14 @@ class NetflowCollector:
         now = time.monotonic()
         elapsed = max(0.5, now - self._last_flush)
         self._last_flush = now
-        ips = set(self._tx_bytes) | set(self._rx_bytes)
-        for ip in ips:
-            tx = self._tx_bytes.pop(ip, 0)
-            rx = self._rx_bytes.pop(ip, 0)
-            mac = db.mac_for_ip(ip)
-            if mac is None:
-                # Unknown LAN IP — drop. The SSH poller will discover it
-                # via DHCP/ARP within a couple of seconds.
-                continue
+        # Drop the IP→MAC cache periodically so DHCP changes get picked up.
+        if now >= self._cache_expires_at:
+            self._ip_mac_cache.clear()
+            self._cache_expires_at = now + 30.0
+        macs = set(self._tx_bytes) | set(self._rx_bytes)
+        for mac in macs:
+            tx = self._tx_bytes.pop(mac, 0)
+            rx = self._rx_bytes.pop(mac, 0)
             db.insert_sample(mac, (tx * 8) / elapsed, (rx * 8) / elapsed)
 
     def stats(self) -> dict:

@@ -62,6 +62,7 @@ You want to see `packets_received > 0`, `records_processed > 0`, and `last_packe
 | `POLL_INTERVAL` | `1` | Seconds between SSH polls (device discovery + WAN totals only) |
 | `RETENTION_DAYS` | `30` | Days of history to keep |
 | `NETFLOW_PORT` | `2055` | UDP port the NetFlow listener binds. Must match the router's *Collector Port* |
+| `LAN_PREFIXES` | RFC1918 + IPv6 ULA + link-local | Comma-separated CIDRs treated as LAN. If your ISP routes a global IPv6 /64, add it here |
 
 ## Troubleshooting
 

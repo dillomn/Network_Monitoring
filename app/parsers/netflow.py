@@ -11,6 +11,7 @@ silently dropped — they'll arrive again next cycle.
 """
 from __future__ import annotations
 
+import socket
 import struct
 from dataclasses import dataclass
 
@@ -29,12 +30,20 @@ F_LAST_SWITCHED = 21
 F_FIRST_SWITCHED = 22
 F_OUT_BYTES = 23
 F_OUT_PKTS = 24
+F_IPV6_SRC_ADDR = 27
+F_IPV6_DST_ADDR = 28
+F_IN_SRC_MAC = 56
+F_OUT_DST_MAC = 57
+F_IN_DST_MAC = 80
+F_OUT_SRC_MAC = 81
 
 
 @dataclass
 class FlowRecord:
     src: str | None = None
     dst: str | None = None
+    src_mac: str | None = None
+    dst_mac: str | None = None
     src_port: int | None = None
     dst_port: int | None = None
     protocol: int | None = None
@@ -46,6 +55,12 @@ class FlowRecord:
 
 # A template is a list of (field_type, field_length_bytes) tuples.
 Template = list[tuple[int, int]]
+
+
+def _format_mac(chunk: bytes) -> str | None:
+    if all(b == 0 for b in chunk):
+        return None  # all-zero MAC is a placeholder, not a real device
+    return ":".join(f"{b:02X}" for b in chunk)
 
 
 def parse_packet(data: bytes, templates: dict[int, Template]) -> list[FlowRecord]:
@@ -108,6 +123,14 @@ def _read_data_records(body: bytes, fields: Template) -> list[FlowRecord]:
                 rec.src = "%d.%d.%d.%d" % tuple(chunk)
             elif ftype == F_IPV4_DST_ADDR and flen == 4:
                 rec.dst = "%d.%d.%d.%d" % tuple(chunk)
+            elif ftype == F_IPV6_SRC_ADDR and flen == 16:
+                rec.src = socket.inet_ntop(socket.AF_INET6, bytes(chunk))
+            elif ftype == F_IPV6_DST_ADDR and flen == 16:
+                rec.dst = socket.inet_ntop(socket.AF_INET6, bytes(chunk))
+            elif ftype in (F_IN_SRC_MAC, F_OUT_SRC_MAC) and flen == 6:
+                rec.src_mac = _format_mac(chunk)
+            elif ftype in (F_IN_DST_MAC, F_OUT_DST_MAC) and flen == 6:
+                rec.dst_mac = _format_mac(chunk)
             elif ftype == F_L4_SRC_PORT:
                 rec.src_port = int.from_bytes(chunk, "big")
             elif ftype == F_L4_DST_PORT:

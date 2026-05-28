@@ -48,5 +48,11 @@ class Settings(BaseSettings):
     # router's "Collector Port" under System Maintenance → NetFlow.
     netflow_port: int = 2055
 
+    # Comma-separated CIDR prefixes treated as "LAN" when attributing
+    # NetFlow records. Defaults cover RFC1918 IPv4 + IPv6 ULA + IPv6
+    # link-local. If your ISP routes a global IPv6 /64 to your LAN, add
+    # that prefix here so v6 traffic is attributed correctly.
+    lan_prefixes: str = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7,fe80::/10"
+
 
 settings = Settings()

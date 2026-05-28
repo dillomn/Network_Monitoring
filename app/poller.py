@@ -132,15 +132,10 @@ class Poller:
                 pass
 
     async def _poll_once(self) -> None:
-        """Reuse the persistent SSH session across polls.
-
-        Layout:
-            - Cache model/firmware on first successful query.
-            - Run DHCP + ARP to learn the LAN.
-            - Run `show traffic <ip>` for each discovered IP.
-            - DB writes happen after queries so a slow disk doesn't hold
-              the SSH session open longer than needed.
-        """
+        """Discovery + WAN-totals only. Per-IP byte rates come from the
+        NetFlow collector (see app/collectors/netflow.py), not from the
+        router's `show traffic <ip>` buffer — the buffer is averaged over
+        a 10s window and there's no precision/unit way to fix that."""
         session = await self._ensure_session()
 
         if self.router_model is None:
@@ -150,17 +145,8 @@ class Poller:
             log.info("Connected to %s (firmware %s)", info.model, info.firmware)
 
         devices = await self.collector.devices(session)
-        ip_to_mac = {d.ip: d.mac for d in devices}
-        flows = await self.collector.flow(list(ip_to_mac.keys()), session)
-
         for d in devices:
             db.upsert_device(d.mac, d.ip, d.hostname)
-        for f in flows:
-            mac = f.mac or ip_to_mac.get(f.ip)
-            if not mac:
-                continue
-            db.insert_sample(mac, f.tx_bps, f.rx_bps, f.sessions)
-
         self.last_device_count = len(devices)
 
         await self._update_wan_rate(session)

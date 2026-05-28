@@ -101,6 +101,14 @@ def list_devices_with_current() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def mac_for_ip(ip: str) -> str | None:
+    """Reverse-lookup IP → MAC from the devices table. Used by the
+    NetFlow collector to attribute flow records back to a known device."""
+    with conn() as c:
+        row = c.execute("SELECT mac FROM devices WHERE ip = ?", (ip,)).fetchone()
+    return row["mac"] if row else None
+
+
 def history_for(mac: str, since_ts: int) -> list[dict]:
     with conn() as c:
         rows = c.execute(

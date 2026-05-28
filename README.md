@@ -1,31 +1,35 @@
 # DrayTek Network Monitor
 
-Polls a DrayTek Vigor router over SSH for per-device bandwidth and serves a live device list + historical graphs from a single Docker container on a Raspberry Pi.
+Receives **NetFlow v9** from a DrayTek Vigor router for accurate per-IP bandwidth, polls the router over SSH for device discovery and WAN totals, and serves a live device list + historical graphs from a single Docker container on a Raspberry Pi.
 
 Built and tested against the **Vigor 2762n** and **Vigor 2765 series**.
 
 ## What it does
 
-- Logs into the DrayTek over SSH (default every 1s)
-- Reads `srv dhcp status` + `ip arp status` for the device list
-- Reads `show traffic <ip> tx|rx` per device for live bandwidth
-- Reads `show statistic` and computes live per-WAN bps from byte-counter deltas between polls
+- Listens on UDP/2055 for NetFlow v9 records from the router and credits each flow's bytes to the LAN-side IP — real packet-accurate per-device bandwidth, not a sampled buffer
+- Logs into the DrayTek over SSH for `srv dhcp status` + `ip arp status` (device list, hostnames, vendor) and `show statistic` (per-WAN cumulative byte counters → live WAN bps via deltas)
 - Stores samples in SQLite (default 30-day retention)
-- Web UI at `http://<pi-ip>:8090` with a sortable device list, live WAN totals, and historical graphs
+- Web UI at `http://<pi-ip>:8090` with sortable device list, live WAN totals, and historical graphs
 
 ## Prerequisites
 
 - Raspberry Pi running 64-bit PiOS (or any Linux host with Docker)
 - Docker: `curl -fsSL https://get.docker.com | sh && sudo usermod -aG docker $USER`
-- LAN reach from the Pi to the DrayTek's SSH port
+- LAN reach from the Pi to the DrayTek's SSH port (TCP 22) and from the router to the Pi's NetFlow port (UDP 2055)
 
 ## DrayTek setup (one-time)
 
 1. **Enable SSH** — *System Maintenance → Management → tick "SSH" → Apply.*
    Verify from the Pi: `ssh admin@<router-ip>` should land at `DrayTek>`.
-2. **Enable Data Flow Monitor** — *Diagnostics → Data Flow Monitor → tick "Enable Data Flow Monitor" → OK.*
-   Without this, `show traffic <ip>` returns all zeros.
-3. *(Recommended)* Create a dedicated read-only user under *System Maintenance → Administrator Password / Management Account* rather than running as `admin`. SSH key auth is not supported on Vigors — password only.
+2. **Enable NetFlow export** — *System Maintenance → NetFlow*:
+   - tick **Enable**
+   - **Collector IP** = the Pi's LAN IP
+   - **Collector Port** = `2055`
+   - **Version** = `v9`
+   - **Active Timeout** = `60` seconds (lower = livelier UI updates; 60 is a good balance)
+   - **Inactive Timeout** = `15` seconds (default is fine)
+   - Click **OK**.
+3. *(Recommended)* Create a dedicated read-only SSH user under *System Maintenance → Administrator Password / Management Account*. SSH key auth is not supported on Vigors — password only.
 
 ## Configure and run
 
@@ -37,6 +41,16 @@ docker compose up -d --build
 
 Open <http://`pi-ip`:8090>. After editing `.env`: `docker compose restart`.
 
+## Verifying NetFlow is flowing
+
+After ~30 seconds of activity, hit:
+
+```bash
+curl http://<pi-ip>:8090/api/netflow/stats
+```
+
+You want to see `packets_received > 0`, `records_processed > 0`, and `last_packet_age_s` under 10 seconds. If `packets_received` stays at 0, the router isn't reaching the collector — usually a firewall on the Pi (`sudo ufw status`) or a wrong Collector IP in the router config.
+
 ## .env reference
 
 | Var | Default | Meaning |
@@ -45,33 +59,19 @@ Open <http://`pi-ip`:8090>. After editing `.env`: `docker compose restart`.
 | `ROUTER_SSH_PORT` | `22` | SSH port |
 | `ROUTER_SSH_USER` | `admin` | SSH username |
 | `ROUTER_SSH_PASSWORD` | *(required)* | SSH password. Wrap in single quotes if it contains `$`, `#`, or `!` |
-| `POLL_INTERVAL` | `1` | Seconds between poll cycles |
+| `POLL_INTERVAL` | `1` | Seconds between SSH polls (device discovery + WAN totals only) |
 | `RETENTION_DAYS` | `30` | Days of history to keep |
-| `TRAFFIC_UNIT` | `kilobits_per_second` | Unit of the integers inside `show traffic <ip>`. See Calibration |
-
-## Calibration
-
-`show traffic <ip>` returns an integer time-series whose unit varies by firmware:
-
-| Vigor model | `TRAFFIC_UNIT` |
-|---|---|
-| 2762n | `bytes_per_minute` |
-| 2765 series (default) | `kilobits_per_second` |
-
-To verify on your firmware:
-
-1. Hit `http://<pi-ip>:8090/debug/ssh/raw-traffic?ip=192.168.1.10`.
-2. Compare each row in the `interpretations` block to the value shown on the router's *Diagnostics → Data Flow Monitor* page for the same IP.
-3. Set `TRAFFIC_UNIT` to the matching key in `.env` and `docker compose restart`.
+| `NETFLOW_PORT` | `2055` | UDP port the NetFlow listener binds. Must match the router's *Collector Port* |
 
 ## Troubleshooting
 
-- **Devices list empty / `show traffic` all zeros** — tick *Diagnostics → Data Flow Monitor → Enable* on the router.
-- **`Permission denied` on SSH** — test manually: `ssh <user>@<router>`. If the password contains `$#!`, wrap the whole `.env` value in single quotes.
+- **`/api/netflow/stats` shows 0 packets** — check the router config (*System Maintenance → NetFlow*), confirm Collector IP is the Pi's LAN IP, confirm UDP 2055 isn't blocked on the Pi. `sudo tcpdump -nni any udp port 2055` on the Pi will show whether packets are arriving at all.
+- **Per-IP rates show but the IP is `unknown` in the UI** — the SSH poller hasn't yet learned that MAC. Wait one poll cycle (~1s).
+- **`Permission denied` on SSH to router** — test manually: `ssh <user>@<router>`. If the password contains `$#!`, wrap the whole `.env` value in single quotes.
 - **`kex_exchange failed` / `no matching cipher`** — add the algorithm DrayTek negotiates to `LEGACY_SSH_KWARGS` in [app/collectors/ssh.py](app/collectors/ssh.py).
-- **Bandwidth numbers look wrong** — re-run Calibration; the unit varies by firmware.
+- **Can't SSH to the router from PuTTY while the container is running** — DrayTek embedded SSH stacks allow only one session at a time and the container holds it persistently. Run `docker compose stop draymon` before SSH'ing, then `docker compose start draymon` after.
 
-A handful of `/debug/ssh/*` endpoints exist for inspecting raw CLI output and unit interpretations — see [app/main.py](app/main.py). All share the poller's single SSH session via an asyncio lock; the DrayTek embedded SSH stack misbehaves under concurrent connections.
+A handful of `/debug/ssh/*` endpoints exist for inspecting raw CLI output — see [app/main.py](app/main.py). They share the poller's single SSH session via an asyncio lock.
 
 ## Docker cheat sheet
 
@@ -90,6 +90,6 @@ Data lives in the `draymon_draymon_data` Docker volume (`docker volume inspect d
 
 DrayTek-side behaviour the code depends on:
 
-- [DrayTek — How do I use the Data Flow Monitor?](https://www.draytek.co.uk/support/guides/kb-vigor-dataflowmonitor) — TX rate and RX rate are reported in **kbps** (drives the default `TRAFFIC_UNIT`).
-- [DrayTek 2710 Telnet Guide (whirlpool.net.au)](https://whirlpool.net.au/wiki/telnet_guide_01) — `traffic [wan1/wan2] [tx/rx]` CLI form that the per-IP `show traffic <ip>` is built on.
+- [RFC 3954 — Cisco Systems NetFlow Services Export Version 9](https://datatracker.ietf.org/doc/html/rfc3954) — the wire format the parser implements.
+- [DrayTek — How do I use the Data Flow Monitor?](https://www.draytek.co.uk/support/guides/kb-vigor-dataflowmonitor) — TX/RX rate display on the router's web UI is in kbps.
 - [DrayTek Telnet Commands for DrayOS Routers (PDF, v1.4)](https://www.i-lan.net.au/dfaq/DrayTek/misc/DrayTek_Telnet%20Commands%20V1.4.pdf) — CLI reference for `srv dhcp status`, `ip arp status`, `sys version`, `show statistic`.

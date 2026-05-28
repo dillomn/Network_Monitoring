@@ -44,5 +44,9 @@ class Settings(BaseSettings):
 
     db_path: str = "/data/netmon.db"
 
+    # UDP port the NetFlow v9 collector listens on. Must match the
+    # router's "Collector Port" under System Maintenance → NetFlow.
+    netflow_port: int = 2055
+
 
 settings = Settings()

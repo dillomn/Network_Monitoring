@@ -8,6 +8,9 @@ services:
     ports:
       # host:container -- Guacamole owns 8080 on the Pi, so we publish on 8090.
       - "8090:8080"
+      # NetFlow v9 ingest from the DrayTek. Must match Collector Port in
+      # router web UI (System Maintenance → NetFlow) and NETFLOW_PORT in .env.
+      - "2055:2055/udp"
     env_file: .env
     environment:
       - DB_PATH=/data/netmon.db

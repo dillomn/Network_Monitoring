@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import db, oui
+from .collectors.netflow import netflow
 from .collectors.ssh import DraytekSession
 from .config import settings
 from .poller import poller
@@ -27,9 +28,11 @@ async def lifespan(_app: FastAPI):
         "Poller started (router=%s ssh:%s every %ss)",
         settings.router_host, settings.router_ssh_port, settings.poll_interval,
     )
+    await netflow.start(settings.netflow_port)
     try:
         yield
     finally:
+        await netflow.stop()
         await poller.stop()
 
 
@@ -48,6 +51,7 @@ async def index() -> str:
 
 @app.get("/api/health")
 async def health() -> dict:
+    nf = netflow.stats()
     return {
         "router": settings.router_host,
         "router_model": poller.router_model,
@@ -58,7 +62,20 @@ async def health() -> dict:
         "last_poll_ok": poller.last_poll_ok,
         "last_error": poller.last_error,
         "device_count": poller.last_device_count,
+        "netflow_port": nf["listening_port"],
+        "netflow_packets": nf["packets_received"],
+        "netflow_records": nf["records_processed"],
+        "netflow_last_packet_age_s": nf["last_packet_age_s"],
+        "netflow_router_addr": nf["last_router_addr"],
     }
+
+
+@app.get("/api/netflow/stats")
+async def netflow_stats_api() -> dict:
+    """Diagnostics for the NetFlow listener — packet/record counts, the
+    list of template IDs seen, last packet timestamp. Use it to verify
+    the router is actually exporting to us."""
+    return netflow.stats()
 
 
 @app.get("/api/wan/current")

@@ -54,5 +54,14 @@ class Settings(BaseSettings):
     # that prefix here so v6 traffic is attributed correctly.
     lan_prefixes: str = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7,fe80::/10"
 
+    # TESTING ONLY — when the router exports inbound NetFlow records with
+    # a dst IP we can't map to a real LAN device (e.g. nested-NAT lab
+    # setups where downloads show up addressed to the DrayTek's own WAN
+    # IP, not the real LAN device), attribute those bytes to the MAC of
+    # this IP instead of dropping them. Leave empty in production.
+    # All inbound traffic that falls through is lumped onto one device, so
+    # this is only meaningful when there's a single test client.
+    netflow_inbound_fallback_ip: str = ""
+
 
 settings = Settings()

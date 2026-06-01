@@ -148,6 +148,11 @@ class NetflowCollector:
             rx_add = rec.out_bytes  # LAN received → download
         elif dst_local and not src_local:
             mac = rec.dst_mac or self._mac_for_ip(rec.dst)
+            # Testing fallback: nested-NAT setups label inbound flows
+            # with the router's own WAN IP, which isn't a real device.
+            # If a fallback is configured, attribute to it.
+            if mac is None and settings.netflow_inbound_fallback_ip:
+                mac = self._mac_for_ip(settings.netflow_inbound_fallback_ip)
             tx_add = rec.out_bytes  # LAN sent (reverse direction)
             rx_add = rec.in_bytes   # LAN received
         else:

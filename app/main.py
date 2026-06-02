@@ -86,6 +86,19 @@ async def netflow_recent_api(limit: int = Query(50, ge=1, le=200)) -> list[dict]
     return netflow.recent(limit)
 
 
+@app.get("/api/portmap")
+async def portmap_api(limit: int = Query(50, ge=1, le=500)) -> dict:
+    """Snapshot of the NAT port-mapping table the poller maintains via
+    `show portmap` on the router. Each entry tells us which real LAN
+    device a (pseudo_ip, pseudo_port) WAN-side slot belongs to —
+    the table NetFlow inbound attribution uses to reverse-NAT."""
+    items = [
+        {"pseudo_ip": k[0], "pseudo_port": k[1], "private_ip": v}
+        for k, v in poller._portmap.items()
+    ]
+    return {"size": len(items), "entries": items[:limit]}
+
+
 @app.get("/api/wan/current")
 async def wan_current() -> list[dict]:
     """Latest tx_bps/rx_bps per WAN, derived from `show statistic` byte

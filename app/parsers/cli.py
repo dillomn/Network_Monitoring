@@ -225,6 +225,45 @@ def smoothed_sample(series: list[int], window: int = 3) -> float:
     return sum(picked) / len(picked)
 
 
+# Portmap line: leading whitespace, three "ip:port" triples, then
+# [index/protocol/flag]. Spaces between the colon and the port number
+# are tolerated because DrayTek right-justifies the port column.
+_PORTMAP_LINE = re.compile(
+    r"^\s*(\d+\.\d+\.\d+\.\d+):\s*(\d+)"     # Private_IP:Port
+    r"\s+(\d+\.\d+\.\d+\.\d+):\s*(\d+)"      # Pseudo_IP:Port (post-NAT, WAN-side)
+    r"\s+(\d+\.\d+\.\d+\.\d+):\s*(\d+)"      # Peer_IP:Port (remote end — discarded)
+    r"\s+\[(\d+)/(\d+)/(\d+)\]"              # [index/protocol/flag]
+)
+
+
+def parse_portmap(text: str) -> dict[tuple[str, int], str]:
+    """`show portmap` -> {(pseudo_ip, pseudo_port): private_ip}.
+
+    Used by the NetFlow collector to reverse the DrayTek's NAT for
+    inbound flow records: the router exports inbound records with
+    `dst = pseudo_ip:pseudo_port` (its own WAN-side address); this
+    table tells us which LAN device that NAT slot belongs to.
+
+    Only TCP (proto 6) and UDP (proto 17) entries are kept. Skip the
+    ":0" placeholder rows (proto 1 / ICMP, internal probes, etc.) —
+    they share the same NAT slot key and would clobber real entries.
+    """
+    out: dict[tuple[str, int], str] = {}
+    for line in text.splitlines():
+        m = _PORTMAP_LINE.match(line)
+        if not m:
+            continue
+        proto = int(m.group(8))
+        if proto not in (6, 17):
+            continue
+        pseudo_port = int(m.group(4))
+        priv_port = int(m.group(2))
+        if pseudo_port == 0 or priv_port == 0:
+            continue
+        out[(m.group(3), pseudo_port)] = m.group(1)
+    return out
+
+
 def parse_statistic(text: str) -> list[WanStat]:
     """`show statistic` -> per-WAN lifetime byte totals.
 

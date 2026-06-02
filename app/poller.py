@@ -43,6 +43,18 @@ class Poller:
         self._last_wan_tx: dict[str, int] = {}
         self._last_wan_rx: dict[str, int] = {}
         self._last_wan_ts: int = 0
+        # NAT port-mapping table from `show portmap`:
+        # {(pseudo_ip, pseudo_port): private_ip}. Lets the NetFlow
+        # collector reverse-NAT inbound records whose dst is the router's
+        # WAN-side address back to the real LAN device. Refreshed on a
+        # slower cadence than the device discovery polls because `show
+        # portmap` can return thousands of rows on a busy router.
+        self._portmap: dict[tuple[str, int], str] = {}
+        self._portmap_poll_counter: int = 0
+        # Refresh portmap every N device-discovery polls. With the default
+        # 1s poll_interval that's 5s, which is fast enough for NAT entries
+        # to be there when a flow record using them arrives.
+        self._portmap_poll_every: int = 5
 
     async def start(self) -> None:
         db.init_db()
@@ -150,6 +162,25 @@ class Poller:
         self.last_device_count = len(devices)
 
         await self._update_wan_rate(session)
+        await self._update_portmap(session)
+
+    async def _update_portmap(self, session: DraytekSession) -> None:
+        """Throttled refresh of the NAT port-mapping table. Skipped most
+        cycles to keep SSH chatter down on busy routers — `show portmap`
+        output scales with active connection count."""
+        self._portmap_poll_counter += 1
+        if self._portmap_poll_counter < self._portmap_poll_every:
+            return
+        self._portmap_poll_counter = 0
+        try:
+            self._portmap = await self.collector.portmap(session)
+        except Exception:
+            log.exception("portmap query failed")
+
+    def lookup_portmap(self, pseudo_ip: str, pseudo_port: int) -> str | None:
+        """Reverse-NAT lookup. Given the WAN-side IP+port from an inbound
+        NetFlow record, return the real LAN IP (or None if not in table)."""
+        return self._portmap.get((pseudo_ip, pseudo_port))
 
     async def _update_wan_rate(self, session: DraytekSession) -> None:
         """Read cumulative WAN byte counters and persist the bps delta

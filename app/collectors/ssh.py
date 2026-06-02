@@ -247,6 +247,14 @@ class DraytekCollector:
         async with _maybe_session(session) as s:
             return parsers.parse_statistic(await s.query("show statistic"))
 
+    async def portmap(self, session: DraytekSession | None = None) -> dict[tuple[str, int], str]:
+        """`show portmap` -> {(pseudo_ip, pseudo_port): private_ip}.
+
+        Used by the NetFlow collector to attribute inbound flow records
+        back to the real LAN device behind NAT."""
+        async with _maybe_session(session) as s:
+            return parsers.parse_portmap(await s.query("show portmap"))
+
 
 # Bits-per-second conversion factors for each supported `traffic_unit`.
 _UNIT_TO_BPS: dict[str, float] = {

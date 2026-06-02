@@ -148,6 +148,14 @@ class NetflowCollector:
             rx_add = rec.out_bytes  # LAN received → download
         elif dst_local and not src_local:
             mac = rec.dst_mac or self._mac_for_ip(rec.dst)
+            # NAT reverse-lookup: inbound records often arrive with `dst`
+            # set to the router's WAN-side IP (post-NAT, before deNAT to
+            # the real LAN device). Consult the portmap table the SSH
+            # poller maintains to find the real LAN IP.
+            if mac is None and rec.dst_port:
+                priv_ip = self._lookup_portmap(rec.dst, rec.dst_port)
+                if priv_ip is not None:
+                    mac = self._mac_for_ip(priv_ip)
             tx_add = rec.out_bytes  # LAN sent (reverse direction)
             rx_add = rec.in_bytes   # LAN received
         else:
@@ -191,6 +199,13 @@ class NetflowCollector:
         mac = db.mac_for_ip(ip)
         self._ip_mac_cache[ip] = mac
         return mac
+
+    def _lookup_portmap(self, pseudo_ip: str, pseudo_port: int) -> str | None:
+        """Ask the poller's NAT table for the real LAN IP behind a
+        (router_WAN_IP, nat_port) tuple. Lazy-imported to avoid a
+        netflow↔poller circular import at module load."""
+        from ..poller import poller as _poller
+        return _poller.lookup_portmap(pseudo_ip, pseudo_port)
 
     async def _flush_loop(self) -> None:
         while not self._stop.is_set():

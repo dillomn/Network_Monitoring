@@ -122,6 +122,12 @@ class NetflowCollector:
         # dropped.
         self._reason_counts: dict[str, int] = {}
         self._reason_counts_bytes: dict[str, int] = {}
+        # Total bytes (in+out) per disposition — volume-weighted, so it
+        # reveals where the BULK of traffic lands regardless of how rarely
+        # the big records arrive. A download whose megabytes show up under
+        # `no_mac` or `outbound` here is being mis-handled, not just
+        # mis-rated.
+        self._reason_bytes: dict[str, int] = {}
         self.last_packet_ts: int = 0
         self.last_router_addr: str | None = None
 
@@ -242,6 +248,7 @@ class NetflowCollector:
         self._reason_counts[reason] = self._reason_counts.get(reason, 0) + 1
         if rec.in_bytes > 0 or rec.out_bytes > 0:
             self._reason_counts_bytes[reason] = self._reason_counts_bytes.get(reason, 0) + 1
+        self._reason_bytes[reason] = self._reason_bytes.get(reason, 0) + rec.in_bytes + rec.out_bytes
 
         # Stash for diagnostics — bounded ring buffer.
         self._recent.append({
@@ -363,6 +370,7 @@ class NetflowCollector:
             # byte counts (the 0-byte flow-creation records are noise).
             "reasons": dict(self._reason_counts),
             "reasons_with_bytes": dict(self._reason_counts_bytes),
+            "reason_bytes": dict(self._reason_bytes),
             "templates_known": sorted(self._templates.keys()),
             # Full field layout (field_type, length) per template so we can
             # see exactly what the router is exporting — the field IDs tell

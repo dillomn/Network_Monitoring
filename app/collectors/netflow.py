@@ -94,6 +94,14 @@ class NetflowCollector:
         # parsing works but attribution is dropping everything.
         self.records_parsed: int = 0
         self.records_processed: int = 0
+        # Disposition tally over ALL records, and separately over only the
+        # records that actually carried bytes. The byte-bearing breakdown
+        # is the real diagnostic: it ignores the flood of 0-byte
+        # flow-creation records DrayTek emits and shows where the records
+        # that matter (flow-expiry, with counts) are being credited or
+        # dropped.
+        self._reason_counts: dict[str, int] = {}
+        self._reason_counts_bytes: dict[str, int] = {}
         self.last_packet_ts: int = 0
         self.last_router_addr: str | None = None
 
@@ -200,6 +208,12 @@ class NetflowCollector:
                 # carries a post-NAT address with no portmap hit).
                 reason = "no_mac"
 
+        # Tally dispositions. The byte-bearing breakdown is what tells us
+        # whether the records that carry counts are being credited.
+        self._reason_counts[reason] = self._reason_counts.get(reason, 0) + 1
+        if rec.in_bytes > 0 or rec.out_bytes > 0:
+            self._reason_counts_bytes[reason] = self._reason_counts_bytes.get(reason, 0) + 1
+
         # Stash for diagnostics — bounded ring buffer.
         self._recent.append({
             "ts": self.last_packet_ts,
@@ -275,6 +289,11 @@ class NetflowCollector:
             "last_packet_ts": self.last_packet_ts,
             "last_packet_age_s": (int(time.time()) - self.last_packet_ts) if self.last_packet_ts else None,
             "last_router_addr": self.last_router_addr,
+            # Disposition histograms. `reasons_with_bytes` is the one to
+            # read: it shows what happens to records that actually carry
+            # byte counts (the 0-byte flow-creation records are noise).
+            "reasons": dict(self._reason_counts),
+            "reasons_with_bytes": dict(self._reason_counts_bytes),
             "templates_known": sorted(self._templates.keys()),
             # Full field layout (field_type, length) per template so we can
             # see exactly what the router is exporting — the field IDs tell

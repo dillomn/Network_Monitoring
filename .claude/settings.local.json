@@ -27,7 +27,8 @@
       "WebFetch(domain:whirlpool.net.au)",
       "WebFetch(domain:www.draytek.com)",
       "WebFetch(domain:www.manualslib.com)",
-      "WebFetch(domain:forums.whirlpool.net.au)"
+      "WebFetch(domain:forums.whirlpool.net.au)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app/collectors/netflow.py'\\).read\\(\\)\\); print\\('OK netflow.py syntax'\\)\")"
     ],
     "additionalDirectories": [
       "c:\\Users\\DillonBrooks\\CCTS\\Shared - Documents\\Team\\SD Technicians\\AutomatedSlaveSuite\\Docker\\Network_Monitoring\\prometheus"

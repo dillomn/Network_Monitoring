@@ -88,6 +88,11 @@ class NetflowCollector:
         self._cache_expires_at: float = 0.0
         # diagnostics
         self.packets_received: int = 0
+        # Every record the parser handed back, regardless of whether we
+        # could credit it. records_processed (below) only counts the
+        # subset that landed on a known device. parsed >> processed means
+        # parsing works but attribution is dropping everything.
+        self.records_parsed: int = 0
         self.records_processed: int = 0
         self.last_packet_ts: int = 0
         self.last_router_addr: str | None = None
@@ -128,12 +133,13 @@ class NetflowCollector:
             self._attribute(rec)
 
     def _attribute(self, rec: FlowRecord) -> None:
-        if rec.src is None or rec.dst is None:
-            return
-        if rec.in_bytes <= 0 and rec.out_bytes <= 0:
-            return
-        src_local = _is_lan(rec.src)
-        dst_local = _is_lan(rec.dst)
+        # Every parsed record is stashed in the diagnostics ring buffer
+        # below WITH a disposition `reason`, even when we drop it. That's
+        # what makes /api/netflow/recent useful on a router whose template
+        # doesn't match expectations — you can see exactly which guard the
+        # records die on (no_bytes, both_local, no_mac, …) instead of an
+        # empty list.
+        self.records_parsed += 1
         # Split in_bytes and out_bytes into TX/RX based on which end is
         # the LAN device. The DrayTek 2765 emits "biflow" records — one
         # record per connection with `in_bytes` = src→dst direction and
@@ -141,42 +147,63 @@ class NetflowCollector:
         # is just 0 and only `in_bytes` carries data; same logic works.
         tx_add = 0
         rx_add = 0
-        mac: str | None
-        if src_local and not dst_local:
-            mac = rec.src_mac or self._mac_for_ip(rec.src)
-            tx_add = rec.in_bytes   # LAN sent → upload
-            rx_add = rec.out_bytes  # LAN received → download
-        elif dst_local and not src_local:
-            mac = rec.dst_mac or self._mac_for_ip(rec.dst)
-            # NAT reverse-lookup: inbound records often arrive with `dst`
-            # set to the router's WAN-side IP (post-NAT, before deNAT to
-            # the real LAN device). Consult the portmap table the SSH
-            # poller maintains to find the real LAN IP.
-            if mac is None and rec.dst_port:
-                priv_ip = self._lookup_portmap(rec.dst, rec.dst_port)
-                if priv_ip is not None:
-                    mac = self._mac_for_ip(priv_ip)
-            tx_add = rec.out_bytes  # LAN sent (reverse direction)
-            rx_add = rec.in_bytes   # LAN received
-        else:
-            return  # LAN↔LAN or WAN↔WAN: not internet bandwidth
-        # How long the bytes in this flow actually took to happen, per the
-        # router's own clock. Zero/missing means we'll fall back to the
-        # flush-window estimate at flush time.
         duration_s = 0.0
-        if rec.last_switched > rec.first_switched > 0:
-            duration_s = (rec.last_switched - rec.first_switched) / 1000.0
-        if mac is not None:
-            if tx_add > 0:
-                self._tx_bytes[mac] = self._tx_bytes.get(mac, 0) + tx_add
-            if rx_add > 0:
-                self._rx_bytes[mac] = self._rx_bytes.get(mac, 0) + rx_add
-            if duration_s > 0 and (tx_add > 0 or rx_add > 0):
-                self._duration_s[mac] = self._duration_s.get(mac, 0.0) + duration_s
-            self.records_processed += 1
+        mac: str | None = None
+
+        if rec.src is None or rec.dst is None:
+            reason = "no_src_or_dst"
+        elif rec.in_bytes <= 0 and rec.out_bytes <= 0:
+            reason = "no_bytes"
+        else:
+            src_local = _is_lan(rec.src)
+            dst_local = _is_lan(rec.dst)
+            if src_local and not dst_local:
+                mac = rec.src_mac or self._mac_for_ip(rec.src)
+                tx_add = rec.in_bytes   # LAN sent → upload
+                rx_add = rec.out_bytes  # LAN received → download
+                reason = "outbound"
+            elif dst_local and not src_local:
+                mac = rec.dst_mac or self._mac_for_ip(rec.dst)
+                # NAT reverse-lookup: inbound records often arrive with
+                # `dst` set to the router's WAN-side IP (post-NAT, before
+                # deNAT to the real LAN device). Consult the portmap table
+                # the SSH poller maintains to find the real LAN IP.
+                if mac is None and rec.dst_port:
+                    priv_ip = self._lookup_portmap(rec.dst, rec.dst_port)
+                    if priv_ip is not None:
+                        mac = self._mac_for_ip(priv_ip)
+                tx_add = rec.out_bytes  # LAN sent (reverse direction)
+                rx_add = rec.in_bytes   # LAN received
+                reason = "inbound"
+            elif src_local and dst_local:
+                reason = "both_local"   # LAN↔LAN: not internet bandwidth
+            else:
+                reason = "both_public"  # WAN↔WAN: not internet bandwidth
+
+        if reason in ("outbound", "inbound"):
+            # How long the bytes in this flow actually took to happen, per
+            # the router's own clock. Zero/missing means we fall back to
+            # the flush-window estimate at flush time.
+            if rec.last_switched > rec.first_switched > 0:
+                duration_s = (rec.last_switched - rec.first_switched) / 1000.0
+            if mac is not None:
+                if tx_add > 0:
+                    self._tx_bytes[mac] = self._tx_bytes.get(mac, 0) + tx_add
+                if rx_add > 0:
+                    self._rx_bytes[mac] = self._rx_bytes.get(mac, 0) + rx_add
+                if duration_s > 0 and (tx_add > 0 or rx_add > 0):
+                    self._duration_s[mac] = self._duration_s.get(mac, 0.0) + duration_s
+                self.records_processed += 1
+            else:
+                # Classified as internet traffic but no known device owns
+                # the LAN-side IP (discovery hasn't seen it, or the record
+                # carries a post-NAT address with no portmap hit).
+                reason = "no_mac"
+
         # Stash for diagnostics — bounded ring buffer.
         self._recent.append({
             "ts": self.last_packet_ts,
+            "reason": reason,
             "mac": mac,
             "tx_add": tx_add, "rx_add": rx_add,
             "duration_s": duration_s,
@@ -243,11 +270,20 @@ class NetflowCollector:
         return {
             "listening_port": self._port,
             "packets_received": self.packets_received,
+            "records_parsed": self.records_parsed,
             "records_processed": self.records_processed,
             "last_packet_ts": self.last_packet_ts,
             "last_packet_age_s": (int(time.time()) - self.last_packet_ts) if self.last_packet_ts else None,
             "last_router_addr": self.last_router_addr,
             "templates_known": sorted(self._templates.keys()),
+            # Full field layout (field_type, length) per template so we can
+            # see exactly what the router is exporting — the field IDs tell
+            # us whether IPV4_SRC/DST (8/12), IPV6 (27/28), IN/OUT_BYTES
+            # (1/23) etc. are present and at what widths.
+            "templates": {
+                tid: [[ftype, flen] for ftype, flen in fields]
+                for tid, fields in self._templates.items()
+            },
             "buffered_ips_tx": len(self._tx_bytes),
             "buffered_ips_rx": len(self._rx_bytes),
         }

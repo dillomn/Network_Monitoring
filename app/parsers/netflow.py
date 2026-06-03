@@ -51,6 +51,12 @@ class FlowRecord:
     out_bytes: int = 0
     in_packets: int = 0
     out_packets: int = 0
+    # sysUpTime (ms since router boot) at the first/last packet of the
+    # flow. Their difference is the flow duration, which the collector
+    # uses as the rate denominator. Default 0 means "not supplied" and
+    # the collector falls back to its flush-window estimate.
+    first_switched: int = 0
+    last_switched: int = 0
 
 
 # A template is a list of (field_type, field_length_bytes) tuples.
@@ -145,6 +151,10 @@ def _read_data_records(body: bytes, fields: Template) -> list[FlowRecord]:
                 rec.in_packets = int.from_bytes(chunk, "big")
             elif ftype == F_OUT_PKTS:
                 rec.out_packets = int.from_bytes(chunk, "big")
+            elif ftype == F_FIRST_SWITCHED:
+                rec.first_switched = int.from_bytes(chunk, "big")
+            elif ftype == F_LAST_SWITCHED:
+                rec.last_switched = int.from_bytes(chunk, "big")
             # Other field types are silently skipped (still consume bytes via flen).
         records.append(rec)
         pos += rec_size

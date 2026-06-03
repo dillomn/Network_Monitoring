@@ -94,6 +94,10 @@ class NetflowCollector:
         # parsing works but attribution is dropping everything.
         self.records_parsed: int = 0
         self.records_processed: int = 0
+        # Records the parser produced that blew up during attribution.
+        # Should be 0; anything else means a per-record bug we're now
+        # surviving instead of silently dropping the rest of the packet.
+        self.records_errored: int = 0
         # Disposition tally over ALL records, and separately over only the
         # records that actually carried bytes. The byte-bearing breakdown
         # is the real diagnostic: it ignores the flood of 0-byte
@@ -138,7 +142,19 @@ class NetflowCollector:
             log.exception("NetFlow parse failed")
             return
         for rec in records:
-            self._attribute(rec)
+            # Guard each record: a bug attributing one record must not
+            # abort the rest of the packet (and must not be swallowed
+            # silently by asyncio's datagram callback). This is exactly
+            # how a missing-attribute crash hid zero throughput before.
+            try:
+                self._attribute(rec)
+            except Exception:
+                self.records_errored += 1
+                if self.records_errored <= 10 or self.records_errored % 500 == 0:
+                    log.exception(
+                        "NetFlow attribute failed (src=%s dst=%s) — total errors=%d",
+                        rec.src, rec.dst, self.records_errored,
+                    )
 
     def _attribute(self, rec: FlowRecord) -> None:
         # Every parsed record is stashed in the diagnostics ring buffer
@@ -286,6 +302,7 @@ class NetflowCollector:
             "packets_received": self.packets_received,
             "records_parsed": self.records_parsed,
             "records_processed": self.records_processed,
+            "records_errored": self.records_errored,
             "last_packet_ts": self.last_packet_ts,
             "last_packet_age_s": (int(time.time()) - self.last_packet_ts) if self.last_packet_ts else None,
             "last_router_addr": self.last_router_addr,

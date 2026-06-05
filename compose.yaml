@@ -14,6 +14,12 @@ services:
     env_file: .env
     environment:
       - DB_PATH=/data/netmon.db
+      # `show traffic <ip>` on the Vigor 2765 reports kilobits/sec; this
+      # scales it to bps. Verified against the router's Data Flow Monitor
+      # (raw 88064 → 88 Mbps). Set here (overrides any stale value in .env)
+      # because it's the verified unit for this hardware. Other DrayTek
+      # models may differ — recalibrate via /debug/ssh/raw-traffic.
+      - TRAFFIC_UNIT=kilobits_per_second
     volumes:
       - draymon_data:/data
 

@@ -28,11 +28,15 @@ async def lifespan(_app: FastAPI):
         "Poller started (router=%s ssh:%s every %ss)",
         settings.router_host, settings.router_ssh_port, settings.poll_interval,
     )
-    await netflow.start(settings.netflow_port)
+    # NetFlow is intentionally NOT started: this DrayTek's hardware
+    # acceleration offloads the bulk data path past the CPU, so NetFlow
+    # exports only see ~1% of real throughput. Per-device rates now come
+    # from the SSH Data Flow Monitor poll in poller.py, which reads a
+    # hardware-aware counter and stays accurate with acceleration on.
+    # Re-enable `netflow.start(...)` only if acceleration is disabled.
     try:
         yield
     finally:
-        await netflow.stop()
         await poller.stop()
 
 

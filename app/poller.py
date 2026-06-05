@@ -144,10 +144,13 @@ class Poller:
                 pass
 
     async def _poll_once(self) -> None:
-        """Discovery + WAN-totals only. Per-IP byte rates come from the
-        NetFlow collector (see app/collectors/netflow.py), not from the
-        router's `show traffic <ip>` buffer — the buffer is averaged over
-        a 10s window and there's no precision/unit way to fix that."""
+        """Discovery + per-device rates + WAN totals, all over the one SSH
+        session. Per-device TX/RX comes from the router's Data Flow Monitor
+        buffer (`show traffic <ip>`), NOT NetFlow: on this DrayTek hardware
+        acceleration offloads the bulk data path past the CPU, so NetFlow
+        only ever counts ~1% of throughput. `show traffic` reads the
+        router's own hardware-aware counter, so it stays accurate with
+        acceleration on — and it's a pure read, so zero forwarding impact."""
         session = await self._ensure_session()
 
         if self.router_model is None:
@@ -161,21 +164,31 @@ class Poller:
             db.upsert_device(d.mac, d.ip, d.hostname)
         self.last_device_count = len(devices)
 
+        await self._update_device_rates(session, devices)
         await self._update_wan_rate(session)
-        await self._update_portmap(session)
 
-    async def _update_portmap(self, session: DraytekSession) -> None:
-        """Throttled refresh of the NAT port-mapping table. Skipped most
-        cycles to keep SSH chatter down on busy routers — `show portmap`
-        output scales with active connection count."""
-        self._portmap_poll_counter += 1
-        if self._portmap_poll_counter < self._portmap_poll_every:
+    async def _update_device_rates(self, session: DraytekSession, devices) -> None:
+        """Poll `show traffic <ip> tx|rx` for each known device and persist
+        the current rate. Scaled by settings.traffic_unit (kilobits_per_second
+        on the Vigor 2765 — calibrated against the Data Flow Monitor page)."""
+        ip_to_mac = {d.ip: d.mac for d in devices if d.ip}
+        if not ip_to_mac:
             return
-        self._portmap_poll_counter = 0
         try:
-            self._portmap = await self.collector.portmap(session)
+            samples = await self.collector.flow(list(ip_to_mac), session)
         except Exception:
-            log.exception("portmap query failed")
+            log.exception("device rate poll failed")
+            return
+        for s in samples:
+            mac = ip_to_mac.get(s.ip)
+            if mac is not None:
+                db.insert_sample(mac, s.tx_bps, s.rx_bps)
+
+    def lookup_portmap(self, pseudo_ip: str, pseudo_port: int) -> str | None:
+        """Reverse-NAT lookup. Given the WAN-side IP+port from an inbound
+        NetFlow record, return the real LAN IP (or None if not in table).
+        Retained for the (currently disabled) NetFlow path."""
+        return self._portmap.get((pseudo_ip, pseudo_port))
 
     def lookup_portmap(self, pseudo_ip: str, pseudo_port: int) -> str | None:
         """Reverse-NAT lookup. Given the WAN-side IP+port from an inbound

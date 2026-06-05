@@ -1,13 +1,17 @@
-"""NetFlow v9 packet parser (RFC 3954).
+"""NetFlow v9 (RFC 3954) and IPFIX / NetFlow v10 (RFC 7011) packet parser.
 
-A v9 datagram has a 20-byte header followed by one or more FlowSets:
-  - Template FlowSet (id=0): defines field layout of upcoming data records
-  - Options Template (id=1): vendor metadata — we ignore these
-  - Data FlowSet (id>=256): packed records matching template id == FlowSet id
+Both formats are template-based and share IANA field IDs, so one set of
+field handlers covers both. The differences we handle:
+  - Header: v9 is 20 bytes (version, count, ...); IPFIX is 16 bytes
+    (version, length, exporttime, seq, observation-domain).
+  - Set IDs: v9 template=0 / options=1; IPFIX template=2 / options=3;
+    data >=256 in both.
+  - IPFIX field definitions set the high bit (0x8000) of the field type
+    for enterprise-specific fields, followed by a 4-byte enterprise
+    number; we consume those bytes but never match such fields.
 
-The router emits templates periodically (typically every ~30 packets or
-every 30s). Data records arriving before their template has been seen are
-silently dropped — they'll arrive again next cycle.
+The router emits templates periodically; data records arriving before
+their template has been seen are silently dropped and re-arrive next cycle.
 """
 from __future__ import annotations
 
@@ -16,7 +20,11 @@ import struct
 from dataclasses import dataclass
 
 NETFLOW_V9 = 9
-HEADER_SIZE = 20
+IPFIX = 10           # a.k.a. NetFlow v10
+HEADER_SIZE = 20     # v9 header; IPFIX header is 16 (see _HEADER_SIZE)
+_HEADER_SIZE = {NETFLOW_V9: 20, IPFIX: 16}
+# (template_set_id, options_set_id) per version.
+_TEMPLATE_SET = {NETFLOW_V9: 0, IPFIX: 2}
 
 # Field type IDs we extract (RFC 3954 §8). Anything else is parsed-and-skipped.
 F_IN_BYTES = 1
@@ -70,44 +78,57 @@ def _format_mac(chunk: bytes) -> str | None:
 
 
 def parse_packet(data: bytes, templates: dict[int, Template]) -> list[FlowRecord]:
-    """Parse a v9 datagram. `templates` is mutated with any new templates."""
-    if len(data) < HEADER_SIZE:
+    """Parse a NetFlow v9 or IPFIX (v10) datagram. `templates` is mutated
+    with any new templates seen."""
+    if len(data) < 16:
         return []
-    if struct.unpack_from("!H", data, 0)[0] != NETFLOW_V9:
+    version = struct.unpack_from("!H", data, 0)[0]
+    header_size = _HEADER_SIZE.get(version)
+    if header_size is None or len(data) < header_size:
         return []
+    template_set_id = _TEMPLATE_SET[version]
+    is_ipfix = version == IPFIX
     records: list[FlowRecord] = []
-    offset = HEADER_SIZE
+    offset = header_size
     n = len(data)
     while offset + 4 <= n:
-        fset_id, fset_len = struct.unpack_from("!HH", data, offset)
-        if fset_len < 4 or offset + fset_len > n:
+        set_id, set_len = struct.unpack_from("!HH", data, offset)
+        if set_len < 4 or offset + set_len > n:
             break
-        body = data[offset + 4:offset + fset_len]
-        if fset_id == 0:
-            _read_templates(body, templates)
-        elif fset_id >= 256:
-            tmpl = templates.get(fset_id)
+        body = data[offset + 4:offset + set_len]
+        if set_id == template_set_id:
+            _read_templates(body, templates, is_ipfix)
+        elif set_id >= 256:
+            tmpl = templates.get(set_id)
             if tmpl is not None:
                 records.extend(_read_data_records(body, tmpl))
-        # fset_id == 1 (options template) — ignored
-        offset += fset_len
+        # options template (v9 set 1 / IPFIX set 3) — ignored
+        offset += set_len
     return records
 
 
-def _read_templates(body: bytes, templates: dict[int, Template]) -> None:
+def _read_templates(body: bytes, templates: dict[int, Template], is_ipfix: bool = False) -> None:
     offset = 0
     n = len(body)
     while offset + 4 <= n:
         tmpl_id, field_count = struct.unpack_from("!HH", body, offset)
         offset += 4
         if tmpl_id < 256:
-            return  # invalid; data flowset IDs >=256
+            return  # invalid; data set IDs are >=256
         fields: Template = []
         for _ in range(field_count):
             if offset + 4 > n:
                 return
             ftype, flen = struct.unpack_from("!HH", body, offset)
             offset += 4
+            if is_ipfix and (ftype & 0x8000):
+                # Enterprise-specific field: a 4-byte enterprise number
+                # follows. Consume it and mark the field so it's skipped
+                # (its numeric ID is in a vendor namespace, not IANA).
+                if offset + 4 > n:
+                    return
+                offset += 4
+                ftype = -1
             fields.append((ftype, flen))
         templates[tmpl_id] = fields
 

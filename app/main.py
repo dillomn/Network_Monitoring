@@ -28,15 +28,21 @@ async def lifespan(_app: FastAPI):
         "Poller started (router=%s ssh:%s every %ss)",
         settings.router_host, settings.router_ssh_port, settings.poll_interval,
     )
-    # NetFlow is intentionally NOT started: this DrayTek's hardware
-    # acceleration offloads the bulk data path past the CPU, so NetFlow
-    # exports only see ~1% of real throughput. Per-device rates now come
-    # from the SSH Data Flow Monitor poll in poller.py, which reads a
-    # hardware-aware counter and stays accurate with acceleration on.
-    # Re-enable `netflow.start(...)` only if acceleration is disabled.
+    # NetFlow/IPFIX listener runs in DIAGNOSTIC-ONLY mode (write_samples
+    # False): it receives + tallies flow records into /api/netflow/stats
+    # reason_bytes but does NOT write per-device samples — the SSH Data
+    # Flow Monitor poll drives the UI. This lets us A/B test whether an
+    # IPFIX export actually carries the bytes (point the router's flow
+    # export at this host:NETFLOW_PORT, download a known size, and read
+    # reason_bytes). The parser handles both v9 and IPFIX. If IPFIX proves
+    # accurate, flip write_samples back on and retire the SSH poll.
+    netflow.write_samples = False
+    await netflow.start(settings.netflow_port)
+    log.info("NetFlow/IPFIX diagnostic listener on udp/%s (not writing samples)", settings.netflow_port)
     try:
         yield
     finally:
+        await netflow.stop()
         await poller.stop()
 
 

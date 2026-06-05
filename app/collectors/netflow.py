@@ -71,6 +71,12 @@ class _Protocol(asyncio.DatagramProtocol):
 class NetflowCollector:
     def __init__(self) -> None:
         self._templates: dict[int, list] = {}
+        # When False, the listener still receives + tallies flow records
+        # (so /api/netflow/stats reason_bytes works) but does NOT write
+        # per-device samples — used to A/B test whether NetFlow/IPFIX
+        # actually carries the bytes, without disturbing the SSH-polled
+        # graph that currently drives the UI.
+        self.write_samples: bool = True
         # Live per-flow rate registry: flow-key -> (mac, tx_bps, rx_bps,
         # expiry_monotonic). Each byte-bearing record we can attribute
         # converts to its OWN rate (bytes ÷ the flow's
@@ -332,6 +338,11 @@ class NetflowCollector:
     def _flush(self) -> None:
         now = time.monotonic()
         self._last_flush = now
+        # Diagnostic mode: don't persist samples (reason_bytes is tallied
+        # in _attribute regardless). Drop the registry so it can't grow.
+        if not self.write_samples:
+            self._flows.clear()
+            return
         # Drop the IP→MAC cache periodically so DHCP changes get picked up.
         if now >= self._cache_expires_at:
             self._ip_mac_cache.clear()

@@ -33,7 +33,9 @@
       "Bash(docker version *)",
       "Bash(docker compose *)",
       "PowerShell($d = Get-Command docker -ErrorAction SilentlyContinue; if \\($d\\) { \"docker: $\\($d.Source\\)\"; docker version --format '{{.Server.Version}}' } else { \"docker NOT on PATH\" }; $py = Get-Command python -ErrorAction SilentlyContinue; if \\($py\\) { \"python: $\\($py.Source\\)\" } else { \"python NOT on PATH\" })",
-      "Bash(git --no-pager diff HEAD -- app/parsers/netflow.py app/collectors/netflow.py)"
+      "Bash(git --no-pager diff HEAD -- app/parsers/netflow.py app/collectors/netflow.py)",
+      "WebFetch(domain:manualzz.com)",
+      "WebFetch(domain:corecasys.com)"
     ],
     "additionalDirectories": [
       "c:\\Users\\DillonBrooks\\CCTS\\Shared - Documents\\Team\\SD Technicians\\AutomatedSlaveSuite\\Docker\\Network_Monitoring\\prometheus"

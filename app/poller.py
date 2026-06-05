@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -168,10 +169,15 @@ class Poller:
         await self._update_wan_rate(session)
 
     async def _update_device_rates(self, session: DraytekSession, devices) -> None:
-        """Poll `show traffic <ip> tx|rx` for each known device and persist
-        the current rate. Scaled by settings.traffic_unit (kilobits_per_second
-        on the Vigor 2765 — calibrated against the Data Flow Monitor page)."""
-        ip_to_mac = {d.ip: d.mac for d in devices if d.ip}
+        """Poll `show traffic <ip> tx|rx` for each LAN client and persist the
+        current rate. Scaled by settings.traffic_unit (kilobits_per_second on
+        the Vigor 2765 — calibrated against the Data Flow Monitor page).
+
+        Only LAN-side IPs are polled: the ARP table also lists WAN-side
+        neighbours (e.g. the upstream 192.168.3.x in the nested-NAT test
+        rig), and a `show traffic` round-trip for each of those is dead time
+        that stretches the poll cycle to ~a minute."""
+        ip_to_mac = {d.ip: d.mac for d in devices if d.ip and self._is_lan_client(d.ip)}
         if not ip_to_mac:
             return
         try:
@@ -183,6 +189,16 @@ class Poller:
             mac = ip_to_mac.get(s.ip)
             if mac is not None:
                 db.insert_sample(mac, s.tx_bps, s.rx_bps)
+
+    def _is_lan_client(self, ip: str) -> bool:
+        """True if `ip` is on the router's own LAN (its /24, derived from
+        ROUTER_HOST). Assumes a /24 LAN — the DrayTek default; widen here if
+        you run a larger LAN or multiple LAN subnets."""
+        try:
+            lan = ipaddress.ip_network(f"{settings.router_host}/24", strict=False)
+            return ipaddress.ip_address(ip) in lan
+        except ValueError:
+            return False
 
     def lookup_portmap(self, pseudo_ip: str, pseudo_port: int) -> str | None:
         """Reverse-NAT lookup. Given the WAN-side IP+port from an inbound

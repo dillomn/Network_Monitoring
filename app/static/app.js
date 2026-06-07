@@ -266,7 +266,55 @@ document.getElementById("m-save-note").addEventListener("click", async () => {
   });
   await refreshDevices();
 });
-document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeModal(); });
+// ---- Settings / troubleshooting modal ----
+let settingsTimer = null;
+
+const SUMMARY_TEXT = { ok: "All checks passed", warn: "Some warnings", fail: "Problems found" };
+
+async function refreshDiagnostics() {
+  const list = document.getElementById("diag-list");
+  try {
+    const d = await fetchJSON("/api/diagnostics");
+    list.innerHTML = d.checks.map(c => `
+      <div class="diag-row">
+        <span class="diag-dot ${c.status}"></span>
+        <div class="diag-body">
+          <div class="diag-label">${escapeHtml(c.label)}<span class="diag-badge ${c.status}">${escapeHtml(c.status)}</span></div>
+          <div class="diag-detail">${escapeHtml(c.detail)}</div>
+          ${c.hint ? `<div class="diag-hint">${escapeHtml(c.hint)}</div>` : ""}
+        </div>
+      </div>`).join("");
+    const sum = document.getElementById("diag-summary");
+    sum.textContent = SUMMARY_TEXT[d.summary] || d.summary;
+    sum.className = d.summary;
+    document.getElementById("diag-updated").textContent = fmtTime(d.generated_ts);
+  } catch (e) {
+    list.innerHTML = `<div class="diag-row"><span class="diag-dot fail"></span>
+      <div class="diag-body"><div class="diag-label">Diagnostics unavailable</div>
+      <div class="diag-detail">${escapeHtml(String(e))}</div></div></div>`;
+  }
+}
+
+function openSettings() {
+  document.getElementById("settings-modal").classList.remove("hidden");
+  refreshDiagnostics();
+  if (settingsTimer) clearInterval(settingsTimer);
+  settingsTimer = setInterval(refreshDiagnostics, 2500);
+}
+
+function closeSettings() {
+  document.getElementById("settings-modal").classList.add("hidden");
+  if (settingsTimer) { clearInterval(settingsTimer); settingsTimer = null; }
+}
+
+document.getElementById("settings-btn").addEventListener("click", openSettings);
+document.getElementById("settings-close").addEventListener("click", closeSettings);
+document.getElementById("settings-modal").addEventListener("click", (e) => {
+  if (e.target.id === "settings-modal") closeSettings();
+});
+document.getElementById("diag-refresh").addEventListener("click", refreshDiagnostics);
+
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeModal(); closeSettings(); } });
 
 document.querySelectorAll("#device-table th.sortable").forEach(th => {
   th.addEventListener("click", () => {

@@ -14,16 +14,14 @@ services:
     env_file: .env
     environment:
       - DB_PATH=/data/netmon.db
-      # `show traffic <ip>` on the Vigor 2765 reports kilobits/sec; this
-      # scales it to bps. Verified against the router's Data Flow Monitor
-      # (raw 88064 → 88 Mbps). Set here (overrides any stale value in .env)
-      # because it's the verified unit for this hardware. Other DrayTek
-      # models may differ — recalibrate via /debug/ssh/raw-traffic.
+      # Debug-only now: scales the legacy `show traffic <ip>` series used by
+      # /debug/ssh/raw-traffic to cross-check NetFlow against the router's
+      # Data Flow Monitor page. Not on the live data path. kilobits/sec is
+      # the Vigor 2765 unit (raw 88064 → 88 Mbps); recalibrate per model.
       - TRAFFIC_UNIT=kilobits_per_second
-      # Poll as fast as the SSH command batch allows (the loop waits this
-      # long *after* each cycle). Effective cadence is bounded by how many
-      # devices we `show traffic` per cycle, which is why we only poll LAN
-      # clients (see _update_device_rates).
+      # Seconds the SSH poll loop sleeps between cycles. The loop only does
+      # discovery (DHCP+ARP), WAN totals, and the NAT port-map now — NetFlow
+      # owns per-device traffic — so 1s is cheap on the router.
       - POLL_INTERVAL=1
     volumes:
       - draymon_data:/data

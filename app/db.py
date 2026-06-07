@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS samples (
 );
 
 -- Per-WAN rate computed from cumulative byte-counter deltas in
--- `show statistic` between polls — independent of the per-IP buffer.
+-- `show statistic` between polls — independent of the NetFlow per-device path.
 CREATE TABLE IF NOT EXISTS wan_samples (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     wan TEXT NOT NULL,
@@ -99,6 +99,17 @@ def list_devices_with_current() -> list[dict]:
             """
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def table_counts() -> dict:
+    """Row counts per table — used by the diagnostics panel to confirm the
+    DB is readable/writable and show how much history exists."""
+    with conn() as c:
+        return {
+            "devices": c.execute("SELECT COUNT(*) AS n FROM devices").fetchone()["n"],
+            "samples": c.execute("SELECT COUNT(*) AS n FROM samples").fetchone()["n"],
+            "wan_samples": c.execute("SELECT COUNT(*) AS n FROM wan_samples").fetchone()["n"],
+        }
 
 
 def mac_for_ip(ip: str) -> str | None:

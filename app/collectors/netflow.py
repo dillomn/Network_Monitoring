@@ -71,11 +71,11 @@ class _Protocol(asyncio.DatagramProtocol):
 class NetflowCollector:
     def __init__(self) -> None:
         self._templates: dict[int, list] = {}
-        # When False, the listener still receives + tallies flow records
-        # (so /api/netflow/stats reason_bytes works) but does NOT write
-        # per-device samples — used to A/B test whether NetFlow/IPFIX
-        # actually carries the bytes, without disturbing the SSH-polled
-        # graph that currently drives the UI.
+        # Diagnostic switch. When False the listener still receives + tallies
+        # records (so /api/netflow/stats `reason_bytes` works) but writes no
+        # per-device samples — handy for inspecting what the router exports
+        # without persisting it. True (default) credits per-device bytes,
+        # which is the live UI source.
         self.write_samples: bool = True
         # Live per-flow rate registry: flow-key -> (mac, tx_bps, rx_bps,
         # expiry_monotonic). Each byte-bearing record we can attribute

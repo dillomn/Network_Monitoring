@@ -2,7 +2,9 @@
 
 Connects to the router over SSH, runs a short batch of `show`/`srv`/`ip`
 commands in one interactive shell session, and returns parsed device
-records + per-IP bandwidth samples.
+records, WAN counters, and the NAT port-map. (Per-IP `show traffic`
+bandwidth is also parsed here, but only for the /debug/ssh/* cross-check
+endpoints — NetFlow drives live per-device traffic.)
 
 Why an interactive shell rather than `conn.run("show arp")` per command?
 DrayTeks ship a custom CLI, not a Unix shell — there's no exec-mode
@@ -225,7 +227,11 @@ class DraytekCollector:
         session: DraytekSession | None = None,
     ) -> list[FlowSample]:
         """Pull `show traffic <ip> tx/rx` for each known IP and convert the
-        last sample of the time-series into a current rate."""
+        last sample of the time-series into a current rate.
+
+        Debug-only: feeds /debug/ssh/flow and /debug/ssh/raw-traffic for
+        cross-checking NetFlow against the router's Data Flow Monitor. Not
+        on the live data path."""
         if not ips:
             return []
         samples: list[FlowSample] = []

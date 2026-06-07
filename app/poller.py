@@ -1,5 +1,4 @@
 import asyncio
-import ipaddress
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -145,13 +144,12 @@ class Poller:
                 pass
 
     async def _poll_once(self) -> None:
-        """Discovery + per-device rates + WAN totals, all over the one SSH
-        session. Per-device TX/RX comes from the router's Data Flow Monitor
-        buffer (`show traffic <ip>`), NOT NetFlow: on this DrayTek hardware
-        acceleration offloads the bulk data path past the CPU, so NetFlow
-        only ever counts ~1% of throughput. `show traffic` reads the
-        router's own hardware-aware counter, so it stays accurate with
-        acceleration on — and it's a pure read, so zero forwarding impact."""
+        """SSH side of the pipeline: device discovery (DHCP + ARP), WAN
+        totals, and the NAT port-map — all over the one SSH session. These
+        feed the NetFlow collector, which is what credits per-device bytes:
+        discovery gives it the IP->MAC map, the port-map lets it reverse-NAT
+        inbound records. Per-device rates are NOT read over SSH; the NetFlow
+        listener owns them (see app/collectors/netflow.py)."""
         session = await self._ensure_session()
 
         if self.router_model is None:
@@ -165,56 +163,35 @@ class Poller:
             db.upsert_device(d.mac, d.ip, d.hostname)
         self.last_device_count = len(devices)
 
-        await self._update_device_rates(session, devices)
         await self._update_wan_rate(session)
-
-    async def _update_device_rates(self, session: DraytekSession, devices) -> None:
-        """Poll `show traffic <ip> tx|rx` for each LAN client and persist the
-        current rate. Scaled by settings.traffic_unit (kilobits_per_second on
-        the Vigor 2765 — calibrated against the Data Flow Monitor page).
-
-        Only LAN-side IPs are polled: the ARP table also lists WAN-side
-        neighbours (e.g. the upstream 192.168.3.x in the nested-NAT test
-        rig), and a `show traffic` round-trip for each of those is dead time
-        that stretches the poll cycle to ~a minute."""
-        ip_to_mac = {d.ip: d.mac for d in devices if d.ip and self._is_lan_client(d.ip)}
-        if not ip_to_mac:
-            return
-        try:
-            samples = await self.collector.flow(list(ip_to_mac), session)
-        except Exception:
-            log.exception("device rate poll failed")
-            return
-        for s in samples:
-            mac = ip_to_mac.get(s.ip)
-            if mac is not None:
-                db.insert_sample(mac, s.tx_bps, s.rx_bps)
-
-    def _is_lan_client(self, ip: str) -> bool:
-        """True if `ip` is on the router's own LAN (its /24, derived from
-        ROUTER_HOST). Assumes a /24 LAN — the DrayTek default; widen here if
-        you run a larger LAN or multiple LAN subnets."""
-        try:
-            lan = ipaddress.ip_network(f"{settings.router_host}/24", strict=False)
-            return ipaddress.ip_address(ip) in lan
-        except ValueError:
-            return False
-
-    def lookup_portmap(self, pseudo_ip: str, pseudo_port: int) -> str | None:
-        """Reverse-NAT lookup. Given the WAN-side IP+port from an inbound
-        NetFlow record, return the real LAN IP (or None if not in table).
-        Retained for the (currently disabled) NetFlow path."""
-        return self._portmap.get((pseudo_ip, pseudo_port))
+        await self._maybe_update_portmap(session)
 
     def lookup_portmap(self, pseudo_ip: str, pseudo_port: int) -> str | None:
         """Reverse-NAT lookup. Given the WAN-side IP+port from an inbound
         NetFlow record, return the real LAN IP (or None if not in table)."""
         return self._portmap.get((pseudo_ip, pseudo_port))
 
+    async def _maybe_update_portmap(self, session: DraytekSession) -> None:
+        """Refresh the NAT port-map on a slower cadence than discovery —
+        `show portmap` can return thousands of rows on a busy router, so we
+        don't pull it every poll. The NetFlow collector consults this table
+        to attribute inbound (downloaded) bytes to the LAN device behind
+        NAT; without it, inbound records addressed to the router's WAN IP
+        land as `no_mac`. Refreshes immediately on first poll, then every
+        `_portmap_poll_every` polls."""
+        self._portmap_poll_counter += 1
+        if self._portmap and self._portmap_poll_counter < self._portmap_poll_every:
+            return
+        self._portmap_poll_counter = 0
+        try:
+            self._portmap = await self.collector.portmap(session)
+        except Exception:
+            log.exception("portmap refresh failed")
+
     async def _update_wan_rate(self, session: DraytekSession) -> None:
         """Read cumulative WAN byte counters and persist the bps delta
-        against the previous reading. Independent of the per-IP buffer,
-        so this is a true near-instantaneous rate at our poll cadence.
+        against the previous reading. Independent of the NetFlow per-device
+        path, so this is a true near-instantaneous rate at our poll cadence.
 
         Skips a sample if the counter went backwards (router reboot, or
         32-bit wrap on a fast link). We could reconstruct around wrap,

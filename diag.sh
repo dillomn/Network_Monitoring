@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# diag.sh — collect everything Claude could possibly need to diagnose
-# DrayTek SSH/CLI scraping issues. Outputs to a timestamped directory and
+# diag.sh — collect everything needed to diagnose DrayTek monitoring issues
+# (NetFlow ingest + SSH discovery). Outputs to a timestamped directory and
 # tars it up. The router password is masked. Safe to run while the stack
 # is up or down.
 #
@@ -130,6 +130,15 @@ fetch_json devices /api/devices
 if [ -f "$OUTDIR/api-devices.json" ] && command -v python3 >/dev/null; then
   python3 -c "import json; print('devices count:', len(json.load(open('$OUTDIR/api-devices.json'))))" 2>/dev/null || true
 fi
+
+section "APP API: DIAGNOSTICS"
+fetch_json diagnostics /api/diagnostics
+
+section "APP API: NETFLOW STATS"
+fetch_json netflow-stats /api/netflow/stats
+
+section "APP API: NETFLOW RECENT (head)"
+fetch_json netflow-recent /api/netflow/recent
 
 # --------------------------------------------------------------------------
 section "DEBUG: SSH INFO"

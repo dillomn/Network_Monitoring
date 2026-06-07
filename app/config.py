@@ -3,8 +3,11 @@ from typing import Literal
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-# How to interpret each integer in the `show traffic <ip> tx|rx` time-series.
-# Different DrayTek firmwares emit different units in the same array:
+# DEBUG-ONLY. NetFlow drives live per-device traffic; the `show traffic <ip>`
+# CLI path survives only in the /debug/ssh/* endpoints (raw-traffic, calibrate)
+# for cross-checking NetFlow against the router's Data Flow Monitor. This tells
+# those endpoints how to read each integer in the time-series — different
+# DrayTek firmwares emit different units:
 #   - 2762n (older firmware) — bytes-per-minute aggregate
 #   - 2765 series            — appears to be bits-per-second already
 # Override per-deployment via the TRAFFIC_UNIT env var.
@@ -28,12 +31,12 @@ class Settings(BaseSettings):
     # Connect/read timeout for the SSH session, per-command.
     ssh_timeout: float = 15.0
 
-    # Unit of the values inside `show traffic <ip>`. Use /debug/calibrate to
-    # confirm. See TrafficUnit above for the choices.
+    # (debug-only) Unit of the values inside `show traffic <ip>`, for the
+    # /debug/ssh/raw-traffic + /debug/calibrate cross-check. See TrafficUnit.
     traffic_unit: TrafficUnit = "kilobits_per_second"
 
-    # When picking a "current" reading from the time-series, average the
-    # last N non-zero samples in the buffer. Default 1 = no averaging
+    # (debug-only) When picking a "current" reading from the time-series,
+    # average the last N non-zero samples in the buffer. Default 1 = no averaging
     # (use the latest sample directly). Higher values flatten spikes
     # because each buffer position already represents a ~10s window on
     # the router side — averaging across positions stacks that window.

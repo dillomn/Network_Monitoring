@@ -11,7 +11,10 @@
 <body>
   <header>
     <h1>DrayTek Network Monitor</h1>
-    <div id="health" class="health">connecting…</div>
+    <div class="header-right">
+      <div id="health" class="health">connecting…</div>
+      <button id="settings-btn" class="icon-btn" title="Settings &amp; troubleshooting" aria-label="Settings & troubleshooting">⚙</button>
+    </div>
   </header>
 
   <main>
@@ -91,6 +94,26 @@
         </label>
       </div>
       <div class="chart-wrap big"><canvas id="m-chart"></canvas></div>
+    </div>
+  </div>
+
+  <div id="settings-modal" class="modal hidden">
+    <div class="modal-card">
+      <button class="close" id="settings-close" aria-label="Close">&times;</button>
+      <header class="modal-head">
+        <div>
+          <h2>Settings &amp; Troubleshooting</h2>
+          <div class="meta"><span id="diag-summary">running checks…</span></div>
+        </div>
+        <div class="totals">
+          <div><span class="lbl">Last checked</span><span id="diag-updated">—</span></div>
+        </div>
+      </header>
+      <div class="modal-controls">
+        <button id="diag-refresh">Refresh now</button>
+        <span class="diag-note">Auto-refreshes while open. No traffic? Feed test data with <code>tools/netflow_sim.py</code>.</span>
+      </div>
+      <div id="diag-list" class="diag-list"></div>
     </div>
   </div>
 

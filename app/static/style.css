@@ -10,6 +10,7 @@
   --rx: #5cc8ff;
   --bad: #ff6b6b;
   --good: #6cdc6c;
+  --warn: #ffcc66;
 }
 
 * { box-sizing: border-box; }
@@ -20,10 +21,17 @@ header {
   padding: 12px 20px; border-bottom: 1px solid var(--border); background: var(--panel);
 }
 header h1 { font-size: 16px; margin: 0; letter-spacing: 0.02em; }
+.header-right { display: flex; align-items: center; gap: 14px; }
 .health { font-size: 12px; color: var(--muted); }
 .health.ok { color: var(--good); }
 .health.bad { color: var(--bad); }
 .wan-live { color: var(--text); font-variant-numeric: tabular-nums; }
+.icon-btn {
+  background: transparent; border: 1px solid var(--border); color: var(--muted);
+  border-radius: 6px; width: 32px; height: 28px; cursor: pointer; font-size: 15px;
+  line-height: 1; display: inline-flex; align-items: center; justify-content: center;
+}
+.icon-btn:hover { color: var(--text); background: var(--panel-2); }
 
 main {
   display: grid;
@@ -123,3 +131,31 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
   border-radius: 5px; padding: 4px 8px; font-size: 12px;
 }
 .modal-controls button { cursor: pointer; }
+
+/* Settings / troubleshooting panel */
+#diag-summary.ok { color: var(--good); }
+#diag-summary.warn { color: var(--warn); }
+#diag-summary.fail { color: var(--bad); }
+.diag-note { font-size: 11px; color: var(--muted); }
+.diag-note code, .diag-detail code { background: var(--bg); border: 1px solid var(--border);
+  padding: 1px 5px; border-radius: 4px; font-size: 11px; }
+.diag-list { overflow: auto; min-height: 120px; }
+.diag-row { display: flex; gap: 12px; align-items: flex-start;
+  padding: 11px 22px; border-bottom: 1px solid var(--border); }
+.diag-dot { flex: 0 0 auto; width: 10px; height: 10px; border-radius: 50%;
+  margin-top: 4px; background: var(--muted); }
+.diag-dot.ok { background: var(--good); }
+.diag-dot.warn { background: var(--warn); }
+.diag-dot.fail { background: var(--bad); }
+.diag-dot.info { background: var(--accent); }
+.diag-body { flex: 1; min-width: 0; }
+.diag-label { font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.diag-badge { font-size: 9px; font-weight: 700; letter-spacing: 0.06em;
+  text-transform: uppercase; padding: 1px 6px; border-radius: 999px;
+  border: 1px solid var(--border); color: var(--muted); }
+.diag-badge.ok { color: var(--good); border-color: var(--good); }
+.diag-badge.warn { color: var(--warn); border-color: var(--warn); }
+.diag-badge.fail { color: var(--bad); border-color: var(--bad); }
+.diag-badge.info { color: var(--accent); border-color: var(--accent); }
+.diag-detail { color: var(--muted); font-size: 12px; margin-top: 3px; word-break: break-word; }
+.diag-hint { color: var(--warn); font-size: 11px; margin-top: 5px; word-break: break-word; }

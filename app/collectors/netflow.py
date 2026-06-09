@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from ipaddress import ip_address, ip_network
 
 from .. import db
@@ -40,16 +41,29 @@ def _parse_lan_prefixes() -> list:
 
 _LAN_NETS = _parse_lan_prefixes()
 
-# How often live per-flow rates are summed per MAC and written to SQLite.
-# Lower = livelier UI but more DB churn.
+# How often per-device rates are computed and written to SQLite. Lower =
+# livelier UI but more DB churn.
 FLUSH_INTERVAL_S = 5.0
 
-# Should match the router's NetFlow "Active Timeout" (System Maintenance →
-# NetFlow). On Vigor 2762/2765 the minimum is 60s, so a long-lived flow is
-# only exported about once a minute; we hold its last-known rate roughly
-# this long between exports so a steady transfer reads as a continuous
-# line instead of a once-a-minute spike.
-ACTIVE_TIMEOUT_S = 60.0
+# Sliding wall-clock window used to turn NetFlow's lumpy byte exports into a
+# smooth bits-per-second rate. Every attributed record's bytes are credited to
+# the device; each flush we sum the bytes credited within the last
+# RATE_WINDOW_S and divide by the window:  rate = Σbytes × 8 ÷ window.
+#
+# This MUST be ≥ the router's NetFlow "Active Timeout" (configurable via
+# NETFLOW_RATE_WINDOW_S; see config.py). The router exports a long-lived flow's
+# bytes only once per active timeout, so a steady transfer arrives as one lump
+# every ~60s. Dividing each lump by the fixed window reconstructs the true
+# average rate (75 MB exported once a minute → a flat ~10 Mbps) and holds it
+# smoothly between exports.
+#
+# Crucially the rate is now grounded entirely in real elapsed time and real
+# byte counts, so it is physically bounded by the link. The old approach
+# divided a lump by the flow's OWN reported duration (FIRST/LAST_SWITCHED);
+# when the router reported a collapsed or zero window that denominator turned
+# a 10 Mbps download into a multi-Gbps phantom spike. We no longer use those
+# timestamps for rating at all.
+RATE_WINDOW_S = settings.netflow_rate_window_s
 
 
 def _is_lan(ip: str) -> bool:
@@ -77,23 +91,24 @@ class NetflowCollector:
         # without persisting it. True (default) credits per-device bytes,
         # which is the live UI source.
         self.write_samples: bool = True
-        # Live per-flow rate registry: flow-key -> (mac, tx_bps, rx_bps,
-        # expiry_monotonic). Each byte-bearing record we can attribute
-        # converts to its OWN rate (bytes ÷ the flow's
-        # FIRST_SWITCHED↔LAST_SWITCHED duration) and refreshes its entry;
-        # _flush sums the still-live entries per MAC. Two reasons for this
-        # shape:
-        #  • Concurrent flows' rates ADD. Summing per-flow rates avoids the
-        #    Σbytes ÷ Σduration trap, where a device's many flows balloon
-        #    the divisor and dilute a fast flow into the weeds.
-        #  • The router exports a flow's bytes only once per Active Timeout
-        #    (≥60s). Crediting that lump to one 5s flush window sawtooths.
-        #    Holding the rate until the next expected export turns sparse
-        #    exports into a smooth, correctly-scaled live line.
-        self._flows: dict[tuple, tuple] = {}
-        # MACs that produced a sample last flush, so when a device goes
-        # idle (all its flows expired) we can emit one explicit 0 rather
-        # than leaving the UI showing a stale rate forever.
+        # Per-device byte accumulators driving the live rate. Bytes from every
+        # attributed record land in the CURRENT-window tallies (_cur_*); each
+        # flush moves them into a per-MAC ring of recent (monotonic_ts, tx, rx)
+        # deposits (_history) and evicts deposits older than RATE_WINDOW_S. The
+        # live rate is Σbytes-in-window × 8 ÷ RATE_WINDOW_S — a sliding
+        # wall-clock byte rate.
+        #
+        # Why bytes-over-wall-clock instead of summing per-flow rates: a flow's
+        # own FIRST/LAST_SWITCHED duration is an unreliable rate denominator on
+        # this hardware (it can come back collapsed or zero), which is what
+        # produced multi-Gbps phantom spikes. Counting real bytes over real
+        # elapsed time can't exceed the link no matter what the router reports.
+        self._cur_tx: dict[str, int] = {}
+        self._cur_rx: dict[str, int] = {}
+        self._history: dict[str, deque[tuple[float, int, int]]] = {}
+        # MACs we wrote a non-zero sample for last flush, so when a device goes
+        # idle (its window empties) we can emit one explicit 0 rather than
+        # leaving the UI showing a stale rate forever.
         self._active_macs: set[str] = set()
         self._last_flush: float = 0.0
         self._transport: asyncio.DatagramTransport | None = None
@@ -233,16 +248,16 @@ class NetflowCollector:
                 reason = "both_public"  # WAN↔WAN: not internet bandwidth
 
         if reason in ("outbound", "inbound"):
-            # How long the bytes in this flow actually took to happen, per
-            # the router's own clock. Zero/missing leaves duration_s at 0
-            # and _register_flow falls back to a flush-window estimate.
+            # duration_s is computed for diagnostics only (it surfaces in
+            # /api/netflow/recent and is exactly the value that, used as a rate
+            # denominator, produced phantom spikes). Rates no longer use it.
             if rec.last_switched > rec.first_switched > 0:
                 duration_s = (rec.last_switched - rec.first_switched) / 1000.0
             if mac is not None:
                 self.records_processed += 1
-                # Register/refresh this flow so its rate can be summed and
-                # held between the router's sparse exports (see _flows).
-                self._register_flow(rec, mac, tx_add, rx_add, duration_s)
+                # Credit the bytes to the device's current window; _flush turns
+                # the rolling byte total into a bits-per-second rate.
+                self._credit(mac, tx_add, rx_add)
             else:
                 # Classified as internet traffic but no known device owns
                 # the LAN-side IP (discovery hasn't seen it, or the record
@@ -273,38 +288,19 @@ class NetflowCollector:
         if len(self._recent) > self._recent_max:
             del self._recent[:len(self._recent) - self._recent_max]
 
-    def _register_flow(
-        self, rec: FlowRecord, mac: str, tx_add: int, rx_add: int, duration_s: float
-    ) -> None:
-        """Store this flow's current rate, keyed by its 5-tuple, with an
-        expiry chosen so the rate is HELD across the router's gap between
-        exports. _flush sums the live entries per MAC. A re-export of the
-        same flow overwrites its key (no double counting); the upload and
-        download halves of one connection have different keys and are both
-        summed onto the device."""
-        if tx_add <= 0 and rx_add <= 0:
-            return
-        now = time.monotonic()
-        if duration_s > 0:
-            tx_bps = (tx_add * 8) / duration_s
-            rx_bps = (rx_add * 8) / duration_s
-            if duration_s >= ACTIVE_TIMEOUT_S * 0.9:
-                # Ran the full Active Timeout → still going; hold a little
-                # past the next expected export so a steady transfer reads
-                # continuously instead of sawtoothing to zero.
-                hold = ACTIVE_TIMEOUT_S + FLUSH_INTERVAL_S * 3
-            else:
-                # Exported early (inactive timeout) → already ended; show
-                # it only for the span it actually represents.
-                hold = max(FLUSH_INTERVAL_S, duration_s)
-        else:
-            # No usable duration (NAT template 290, or first==last): treat
-            # the bytes as a single flush window's worth.
-            tx_bps = (tx_add * 8) / FLUSH_INTERVAL_S
-            rx_bps = (rx_add * 8) / FLUSH_INTERVAL_S
-            hold = FLUSH_INTERVAL_S
-        key = (rec.src, rec.dst, rec.src_port, rec.dst_port, rec.protocol)
-        self._flows[key] = (mac, tx_bps, rx_bps, now + hold)
+    def _credit(self, mac: str, tx_add: int, rx_add: int) -> None:
+        """Add an attributed record's bytes to the device's current-window
+        tally. _flush rolls these into the per-MAC history ring and converts
+        the windowed byte total into a bits-per-second rate.
+
+        The upload and download halves of one connection arrive as separate
+        records and both land on the same MAC; re-exports of a long-lived flow
+        simply add the next chunk of bytes — there's no per-flow rate to
+        double-count, so no 5-tuple bookkeeping is needed."""
+        if tx_add > 0:
+            self._cur_tx[mac] = self._cur_tx.get(mac, 0) + tx_add
+        if rx_add > 0:
+            self._cur_rx[mac] = self._cur_rx.get(mac, 0) + rx_add
 
     def _mac_for_ip(self, ip: str) -> str | None:
         """Cached IP→MAC lookup. Cache is cleared every 30s in _flush() so
@@ -338,30 +334,45 @@ class NetflowCollector:
     def _flush(self) -> None:
         now = time.monotonic()
         self._last_flush = now
-        # Diagnostic mode: don't persist samples (reason_bytes is tallied
-        # in _attribute regardless). Drop the registry so it can't grow.
+        # Move this window's freshly-credited bytes into each device's history
+        # ring, then reset the current-window tallies. Done even in diagnostic
+        # mode so the accumulators can't grow without bound.
+        for mac in set(self._cur_tx) | set(self._cur_rx):
+            self._history.setdefault(mac, deque()).append(
+                (now, self._cur_tx.get(mac, 0), self._cur_rx.get(mac, 0))
+            )
+        self._cur_tx.clear()
+        self._cur_rx.clear()
+        # Evict deposits that have aged out of the sliding window; drop devices
+        # whose window is now empty.
+        cutoff = now - RATE_WINDOW_S
+        for mac, hist in list(self._history.items()):
+            while hist and hist[0][0] < cutoff:
+                hist.popleft()
+            if not hist:
+                del self._history[mac]
+
+        # Diagnostic mode: tally only (reason_bytes is kept in _attribute);
+        # don't persist samples.
         if not self.write_samples:
-            self._flows.clear()
             return
         # Drop the IP→MAC cache periodically so DHCP changes get picked up.
         if now >= self._cache_expires_at:
             self._ip_mac_cache.clear()
             self._cache_expires_at = now + 30.0
-        # Expire flows past their hold window, then sum what's still live.
-        expired = [k for k, v in self._flows.items() if v[3] <= now]
-        for k in expired:
-            del self._flows[k]
-        tx_by_mac: dict[str, float] = {}
-        rx_by_mac: dict[str, float] = {}
-        for mac, tx_bps, rx_bps, _expiry in self._flows.values():
-            tx_by_mac[mac] = tx_by_mac.get(mac, 0.0) + tx_bps
-            rx_by_mac[mac] = rx_by_mac.get(mac, 0.0) + rx_bps
-        for mac in set(tx_by_mac) | set(rx_by_mac):
-            db.insert_sample(mac, tx_by_mac.get(mac, 0.0), rx_by_mac.get(mac, 0.0))
-        # Devices active last flush but with no live flows now → write one
-        # explicit 0 so the UI drops them back to idle instead of holding a
-        # stale rate.
-        active_now = set(tx_by_mac) | set(rx_by_mac)
+        # Sliding-window rate per device: Σbytes in the last RATE_WINDOW_S × 8
+        # ÷ the window. Bounded by the link; smooth across the router's sparse
+        # exports. A device's rate falls to zero on its own once its window
+        # empties.
+        active_now: set[str] = set()
+        for mac, hist in self._history.items():
+            tx_bps = sum(d[1] for d in hist) * 8 / RATE_WINDOW_S
+            rx_bps = sum(d[2] for d in hist) * 8 / RATE_WINDOW_S
+            if tx_bps > 0 or rx_bps > 0:
+                db.insert_sample(mac, tx_bps, rx_bps)
+                active_now.add(mac)
+        # Devices active last flush but quiet now → write one explicit 0 so the
+        # UI drops them back to idle instead of holding a stale rate.
         for mac in self._active_macs - active_now:
             db.insert_sample(mac, 0.0, 0.0)
         self._active_macs = active_now
@@ -391,9 +402,9 @@ class NetflowCollector:
                 tid: [[ftype, flen] for ftype, flen in fields]
                 for tid, fields in self._templates.items()
             },
-            "buffered_flows": len(self._flows),
-            "buffered_ips_tx": len({v[0] for v in self._flows.values() if v[1] > 0}),
-            "buffered_ips_rx": len({v[0] for v in self._flows.values() if v[2] > 0}),
+            "tracked_devices": len(self._history),
+            "windowed_bytes_tx": sum(d[1] for h in self._history.values() for d in h),
+            "windowed_bytes_rx": sum(d[2] for h in self._history.values() for d in h),
         }
 
     def recent(self, limit: int = 50) -> list[dict]:

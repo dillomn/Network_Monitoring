@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY tools ./tools
+COPY tests ./tests
 
 ENV PYTHONUNBUFFERED=1 \
     DB_PATH=/data/netmon.db

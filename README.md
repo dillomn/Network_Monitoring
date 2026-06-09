@@ -29,7 +29,7 @@ Built and tested against the **Vigor 2762n** and **Vigor 2765 series**.
    - **Collector IP** = the Pi's LAN IP
    - **Collector Port** = `2055`
    - **Version** = `v9`
-   - **Active Timeout** = `60` seconds (lower = livelier UI updates; 60 is a good balance)
+   - **Active Timeout** = `60` seconds (lower = livelier UI updates; 60 is a good balance). Keep `NETFLOW_RATE_WINDOW_S` ≥ this value (see `.env.example`) — the collector averages each device's bytes over that window, and it must span at least one export.
    - **Inactive Timeout** = `15` seconds (default is fine)
    - Click **OK**.
 3. *(Recommended)* Create a dedicated read-only SSH user under *System Maintenance → Administrator Password / Management Account*. SSH key auth is not supported on Vigors — password only.

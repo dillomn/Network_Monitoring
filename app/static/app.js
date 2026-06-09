@@ -151,7 +151,28 @@ function renderDeviceTable() {
   updateSortIndicators();
 }
 
+// The collector writes a sample bucket only when a device has traffic (flows
+// are placed in the buckets they spanned), so idle stretches have no points.
+// Without this, Chart.js draws a straight line across the gap — making an idle
+// hour look like sustained traffic. Insert explicit zeros at the edges of any
+// gap wider than GAP_S so the line drops to 0 between bursts.
+const GAP_S = 30;
+function fillGaps(points) {
+  if (points.length < 2) return points;
+  const out = [];
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    if (i > 0 && p.ts - points[i - 1].ts > GAP_S) {
+      out.push({ ts: points[i - 1].ts + 1, tx_bps: 0, rx_bps: 0 });
+      out.push({ ts: p.ts - 1, tx_bps: 0, rx_bps: 0 });
+    }
+    out.push(p);
+  }
+  return out;
+}
+
 function chartConfig(label, points) {
+  points = fillGaps(points);
   const peak = points.reduce((m, p) => Math.max(m, p.tx_bps || 0, p.rx_bps || 0), 0);
   const yUnit = pickAxisUnit(peak);
   return {

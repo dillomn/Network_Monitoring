@@ -29,8 +29,8 @@ Built and tested against the **Vigor 2762n** and **Vigor 2765 series**.
    - **Collector IP** = the Pi's LAN IP
    - **Collector Port** = `2055`
    - **Version** = `v9`
-   - **Active Timeout** = `60` seconds (lower = livelier UI updates; 60 is a good balance). Keep `NETFLOW_RATE_WINDOW_S` ≥ this value (see `.env.example`) — the collector averages each device's bytes over that window, and it must span at least one export.
-   - **Inactive Timeout** = `15` seconds (default is fine)
+   - **Active Timeout** = `60` seconds (the Vigor minimum). Note: this firmware does not actually chop an ongoing flow at the active timeout — a long download is exported as a single record only when it ends. The collector handles that by spreading each flow's bytes across the time span it reports (`flow_start`→`flow_end`), so the chart shows the transfer at the right rate over the right interval. The trade-off is that an in-progress long download doesn't appear until it finishes.
+   - **Inactive Timeout** = `15` seconds (the Vigor minimum; lower = bursty flows show up sooner)
    - Click **OK**.
 3. *(Recommended)* Create a dedicated read-only SSH user under *System Maintenance → Administrator Password / Management Account*. SSH key auth is not supported on Vigors — password only.
 

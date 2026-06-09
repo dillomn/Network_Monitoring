@@ -43,10 +43,39 @@ CREATE INDEX IF NOT EXISTS idx_wan_samples_ts ON wan_samples(ts);
 """
 
 
+# A device's "current" rate is the value of its most recent sample bucket, but
+# only if that bucket is fresh. Long flows are exported by the router only when
+# they end, so once a device falls quiet no new buckets arrive — past this many
+# seconds with no sample we report it as idle (0) instead of a stale rate.
+CURRENT_STALE_S = 30
+
+
 def init_db() -> None:
     Path(settings.db_path).parent.mkdir(parents=True, exist_ok=True)
     with conn() as c:
         c.executescript(SCHEMA)
+        _migrate_unique_samples(c)
+
+
+def _migrate_unique_samples(c) -> None:
+    """The collector upserts one sample row per (mac, ts) bucket and ADDS each
+    flow's contribution to it (a flow's bytes are spread across the buckets it
+    spanned, so several flows and flush cycles touch the same bucket). That
+    needs a UNIQUE(mac, ts) index for the ON CONFLICT clause.
+
+    Runs once. Older DBs hold samples from the previous model, whose values are
+    both wrong (the end-of-download spike) and semantically incompatible — they
+    stored an absolute per-flush rate, not an additive per-bucket one, so an
+    upsert-add onto a surviving old row would corrupt it. Clear the table for a
+    clean slate before adding the unique index."""
+    have = c.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' "
+        "AND name='idx_samples_mac_ts_unique'"
+    ).fetchone()
+    if have:
+        return
+    c.execute("DELETE FROM samples")
+    c.execute("CREATE UNIQUE INDEX idx_samples_mac_ts_unique ON samples(mac, ts)")
 
 
 @contextmanager
@@ -85,6 +114,26 @@ def insert_sample(mac: str, tx_bps: float, rx_bps: float, sessions: int | None =
         )
 
 
+def add_samples(rows: list[tuple[str, int, float, float]]) -> None:
+    """Upsert per-(mac, ts) sample rows, ADDING each call's rate onto whatever
+    is already stored for that bucket. The collector spreads one flow's bytes
+    across the buckets it spanned, and many flows (across many flush cycles)
+    land in the same bucket — adding accumulates them into the true aggregate
+    rate. `rows` is (mac, ts, tx_bps, rx_bps)."""
+    if not rows:
+        return
+    with conn() as c:
+        c.executemany(
+            """
+            INSERT INTO samples (mac, ts, tx_bps, rx_bps) VALUES (?, ?, ?, ?)
+            ON CONFLICT(mac, ts) DO UPDATE SET
+                tx_bps = samples.tx_bps + excluded.tx_bps,
+                rx_bps = samples.rx_bps + excluded.rx_bps
+            """,
+            rows,
+        )
+
+
 def list_devices_with_current() -> list[dict]:
     with conn() as c:
         rows = c.execute(
@@ -98,7 +147,18 @@ def list_devices_with_current() -> list[dict]:
             ORDER BY (tx_bps + rx_bps) DESC NULLS LAST, d.hostname
             """
         ).fetchall()
-    return [dict(r) for r in rows]
+    now = int(time.time())
+    out = []
+    for r in rows:
+        d = dict(r)
+        # Report a rate only if the latest sample bucket is fresh; otherwise the
+        # device is idle and its last-known rate would read as a stale "current".
+        ls = d.get("last_sample")
+        if ls is None or now - ls > CURRENT_STALE_S:
+            d["tx_bps"] = 0.0
+            d["rx_bps"] = 0.0
+        out.append(d)
+    return out
 
 
 def table_counts() -> dict:

@@ -217,7 +217,7 @@ async def diagnostics() -> dict:
         checks.append(_check(
             "nf_attrib", "NetFlow attribution", "ok",
             f"{processed}/{parsed} records credited; {nf['tracked_devices']} devices "
-            f"in the rate window, {nf['records_errored']} errored",
+            f"with samples pending flush, {nf['records_errored']} errored",
         ))
 
     # NetFlow byte attribution — the accuracy lens (ties to the HW-accel caveat).

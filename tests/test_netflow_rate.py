@@ -1,11 +1,12 @@
 """Regression tests for NetFlow per-device rate computation.
 
-These pin the fix for the multi-Gbps "phantom spike" bug. A flow record whose
-router-reported duration (FIRST_SWITCHED/LAST_SWITCHED) collapsed to near-zero
-used to make `bytes / duration` explode into Gbps — a steady 10 Mbps download
-read as ~7 Gbps. Rates are now a sliding wall-clock byte average
-(Σbytes in RATE_WINDOW_S × 8 ÷ window), which is physically bounded by the link
-no matter what timestamps the router sends.
+These pin the fix for the "end-of-download spike". This Vigor holds a long flow
+and exports its ENTIRE byte count in one record when the flow ends, stamped with
+flow_start/flow_end spanning the whole transfer (e.g. 1.6 GB over 283 s). The old
+code credited those bytes to the instant the record arrived, dumping minutes of
+traffic into one window → a multi-hundred-Mbps phantom spike. The collector now
+SPREADS each flow's bytes across the time buckets it actually spanned, so the
+rate reads ~45 Mbps placed across the 283 s it really happened.
 
 No third-party deps — pure stdlib unittest. Run from the repo root:
 
@@ -17,6 +18,7 @@ or inside the container:
 """
 import os
 import sys
+import tempfile
 import unittest
 
 # Allow running both as `python -m unittest tests.test_netflow_rate` from the
@@ -29,130 +31,141 @@ from app.parsers.netflow import FlowRecord
 
 LAN_IP = "192.168.1.10"
 LAN_MAC = "AA:BB:CC:00:00:10"
+# A realistic arrival wall-clock time (when the end-of-flow record lands).
+ARRIVAL_TS = 1_780_969_166
 
 
 class FakeClock:
-    """Deterministic stand-in for the module's `time`, exposing the two calls
-    the collector makes: monotonic() (rates/eviction) and time() (packet ts)."""
+    """Deterministic stand-in for the module's `time`. _flush uses monotonic()
+    only; _attribute reads the collector's last_packet_ts, which we set."""
 
-    def __init__(self, mono: float = 1_000.0, wall: int = 1_700_000_000) -> None:
+    def __init__(self, mono: float = 1_000.0) -> None:
         self._mono = mono
-        self._wall = wall
 
     def monotonic(self) -> float:
         return self._mono
 
     def time(self) -> int:
-        return int(self._wall)
-
-    def advance(self, secs: float) -> None:
-        self._mono += secs
-        self._wall += secs
+        return ARRIVAL_TS
 
 
 def _lan_record(out_bytes: int = 0, in_bytes: int = 0,
-                first_ms: int = 1_000, last_ms: int = 1_086,
+                flow_start_ms: int = 0, flow_end_ms: int = 0,
                 src_port: int = 40_000) -> FlowRecord:
     """An 'outbound'-classified record (src is the LAN device), the shape the
-    DrayTek exports for a connection initiated from the LAN: in_bytes = LAN
-    upload (TX), out_bytes = LAN download (RX). A tiny first→last gap is the
-    collapsed-duration bug trigger. src_mac is set so attribution needs no DB."""
+    Vigor exports for a LAN-initiated connection: in_bytes = LAN upload (TX),
+    out_bytes = LAN download (RX). flow_start/end_ms are router-clock ms; only
+    their difference matters. src_mac is set so attribution needs no DB."""
     return FlowRecord(
-        src=LAN_IP, dst="8.8.8.8", src_mac=LAN_MAC,
+        src=LAN_IP, dst="185.125.190.40", src_mac=LAN_MAC,
         src_port=src_port, dst_port=443, protocol=6,
         in_bytes=in_bytes, out_bytes=out_bytes,
-        first_switched=first_ms, last_switched=last_ms,
+        flow_start_ms=flow_start_ms, flow_end_ms=flow_end_ms,
     )
 
 
-class NetflowRateTest(unittest.TestCase):
+class SpreadTest(unittest.TestCase):
     def setUp(self) -> None:
-        # Deterministic clock and a fixed 60s window, independent of any local
-        # .env override of NETFLOW_RATE_WINDOW_S.
         self.clock = FakeClock()
         self._real_time = nf.time
         nf.time = self.clock
-        self._real_window = nf.RATE_WINDOW_S
-        nf.RATE_WINDOW_S = 60.0
-
-        # Capture samples instead of writing SQLite.
-        self.samples: list[tuple[str, float, float]] = []
-        self._real_insert = db.insert_sample
-        db.insert_sample = (
-            lambda mac, tx, rx, sessions=None: self.samples.append((mac, tx, rx))
-        )
-
+        self.rows: list[tuple] = []
+        self._real_add = db.add_samples
+        db.add_samples = lambda rows: self.rows.extend(rows)
         self.c = nf.NetflowCollector()
+        self.c.last_packet_ts = ARRIVAL_TS
+        self.bucket = nf.SAMPLE_BUCKET_S
 
     def tearDown(self) -> None:
         nf.time = self._real_time
-        nf.RATE_WINDOW_S = self._real_window
-        db.insert_sample = self._real_insert
+        db.add_samples = self._real_add
 
-    def test_collapsed_duration_does_not_spike(self) -> None:
-        # 75 MB downloaded over a ~60s active-timeout export, but the router
-        # reports the flow window as 86 ms — the exact shape that produced the
-        # ~7 Gbps spike when rate was bytes / reported-duration.
-        self.c._attribute(_lan_record(out_bytes=75_000_000, first_ms=1_000, last_ms=1_086))
+    def _rx_at(self):
+        """rate values written, by bucket ts -> rx_bps (after _flush)."""
+        return {ts: rx for (_mac, ts, _tx, rx) in self.rows}
+
+    def test_long_download_is_spread_not_spiked(self) -> None:
+        # 1.586 GB downloaded over 283 s, exported as ONE record at flow end.
+        total = 1_586_000_000
+        dur_s = 283
+        self.c._attribute(_lan_record(
+            out_bytes=total, flow_start_ms=1_000_000, flow_end_ms=1_000_000 + dur_s * 1000,
+        ))
         self.c._flush()
 
-        self.assertEqual(len(self.samples), 1)
-        mac, tx, rx = self.samples[-1]
-        self.assertEqual(mac, LAN_MAC)
-        # Correct rate: 75 MB × 8 / 60s window = 10 Mbps.
-        self.assertAlmostEqual(rx, 10_000_000, delta=1.0)
-        # What the old duration-based denominator would have produced:
-        phantom = 75_000_000 * 8 / 0.086  # ≈ 6.98 Gbps
-        self.assertLess(rx, phantom / 100)  # we're >100x below the phantom spike
+        rx = self._rx_at()
+        self.assertGreater(len(rx), 25)  # ~29 buckets of 10 s across 283 s
 
-    def test_reexports_sum_without_double_count(self) -> None:
-        # Two delta-semantics exports of the same flow (same 5-tuple) within one
-        # window total 75 MB; they must sum to 10 Mbps, not double-count.
-        self.c._attribute(_lan_record(out_bytes=37_500_000, first_ms=1_000, last_ms=1_005))
-        self.c._attribute(_lan_record(out_bytes=37_500_000, first_ms=6_000, last_ms=6_005))
+        # True average rate: 1.586 GB × 8 / 283 s ≈ 44.8 Mbps. Interior buckets
+        # read that; partial edge buckets read a bit less. Nothing reads the
+        # phantom value the old code produced (all bytes in one 10 s bucket =
+        # 1.586e9 × 8 / 10 ≈ 1.27 Gbps; or in one 60 s window ≈ 211 Mbps).
+        peak = max(rx.values())
+        self.assertLess(peak, 55_000_000)          # not a spike
+        self.assertGreater(peak, 40_000_000)        # but the right magnitude
+        self.assertAlmostEqual(peak, total * 8 / dur_s, delta=peak * 0.02)
+
+        # Conservation: Σ(rate × bucket ÷ 8) must equal the bytes downloaded.
+        bytes_back = sum(v * self.bucket / 8 for v in rx.values())
+        self.assertAlmostEqual(bytes_back, total, delta=total * 0.001)
+
+        # Every bucket sits within the flow's real wall-clock span.
+        self.assertTrue(all(ARRIVAL_TS - dur_s - self.bucket <= ts <= ARRIVAL_TS
+                            for ts in rx))
+
+    def test_zero_duration_record_lands_in_one_bucket(self) -> None:
+        # No usable timestamps (the common small control flow) → all bytes in
+        # the single bucket at the arrival time.
+        self.c._attribute(_lan_record(out_bytes=5000))  # flow_start/end_ms = 0
         self.c._flush()
+        rx = self._rx_at()
+        self.assertEqual(len(rx), 1)
+        ts, val = next(iter(rx.items()))
+        self.assertEqual(ts % self.bucket, 0)
+        self.assertAlmostEqual(val, 5000 * 8 / self.bucket, delta=1.0)
 
-        _, _, rx = self.samples[-1]
-        self.assertAlmostEqual(rx, 10_000_000, delta=1.0)
-
-    def test_upload_and_download_split(self) -> None:
-        # in_bytes → TX (upload), out_bytes → RX (download), each averaged over
-        # the window independently.
-        self.c._attribute(_lan_record(in_bytes=1_200_000, out_bytes=6_000_000))
+    def test_tx_and_rx_split(self) -> None:
+        # in_bytes → TX (upload), out_bytes → RX (download), zero duration.
+        self.c._attribute(_lan_record(in_bytes=1000, out_bytes=4000))
         self.c._flush()
+        self.assertEqual(len(self.rows), 1)
+        _mac, _ts, tx, rx = self.rows[0]
+        self.assertAlmostEqual(tx, 1000 * 8 / self.bucket, delta=1.0)
+        self.assertAlmostEqual(rx, 4000 * 8 / self.bucket, delta=1.0)
 
-        _, tx, rx = self.samples[-1]
-        self.assertAlmostEqual(tx, 1_200_000 * 8 / 60.0, delta=1.0)  # 160 kbps
-        self.assertAlmostEqual(rx, 6_000_000 * 8 / 60.0, delta=1.0)  # 800 kbps
-
-    def test_rate_decays_to_zero_after_window(self) -> None:
-        self.c._attribute(_lan_record(out_bytes=75_000_000))
-        self.c._flush()
-        self.assertAlmostEqual(self.samples[-1][2], 10_000_000, delta=1.0)
-
-        # Advance past the window with no new traffic: the deposit ages out of
-        # the sliding window and the device gets exactly one explicit zero so
-        # the UI drops it to idle (instead of holding the stale rate forever).
-        self.clock.advance(nf.RATE_WINDOW_S + nf.FLUSH_INTERVAL_S)
-        self.c._flush()
-        self.assertEqual(self.samples[-1], (LAN_MAC, 0.0, 0.0))
-
-        # A further idle flush writes nothing more (device already idle).
-        before = len(self.samples)
-        self.clock.advance(nf.FLUSH_INTERVAL_S)
-        self.c._flush()
-        self.assertEqual(len(self.samples), before)
-
-    def test_diagnostic_mode_writes_nothing_but_stays_bounded(self) -> None:
+    def test_diagnostic_mode_writes_nothing(self) -> None:
         self.c.write_samples = False
-        self.c._attribute(_lan_record(out_bytes=75_000_000))
+        self.c._attribute(_lan_record(out_bytes=1_000_000,
+                                      flow_start_ms=1_000, flow_end_ms=51_000))
         self.c._flush()
-        self.assertEqual(self.samples, [])  # nothing persisted
+        self.assertEqual(self.rows, [])
+        self.assertEqual(self.c._pending, {})  # cleared, can't grow unbounded
 
-        # History is still evicted so the accumulators can't grow unbounded.
-        self.clock.advance(nf.RATE_WINDOW_S + nf.FLUSH_INTERVAL_S)
-        self.c._flush()
-        self.assertEqual(self.c._history, {})
+
+class UpsertAddTest(unittest.TestCase):
+    """db.add_samples must ADD into an existing (mac, ts) bucket, so a later
+    flow that overlaps an already-written past bucket accumulates rather than
+    overwrites."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self._real_path = db.settings.db_path
+        db.settings.db_path = self.tmp.name
+        db.init_db()
+
+    def tearDown(self) -> None:
+        db.settings.db_path = self._real_path
+        os.unlink(self.tmp.name)
+
+    def test_add_accumulates_per_bucket(self) -> None:
+        db.add_samples([("AA", 1000, 10.0, 100.0)])
+        db.add_samples([("AA", 1000, 5.0, 50.0)])   # same bucket → adds
+        db.add_samples([("AA", 1010, 1.0, 2.0)])     # different bucket
+        pts = db.history_for("AA", 0)
+        by_ts = {p["ts"]: (p["tx_bps"], p["rx_bps"]) for p in pts}
+        self.assertEqual(by_ts[1000], (15.0, 150.0))
+        self.assertEqual(by_ts[1010], (1.0, 2.0))
 
 
 if __name__ == "__main__":

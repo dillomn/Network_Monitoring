@@ -51,14 +51,6 @@ class Settings(BaseSettings):
     # router's "Collector Port" under System Maintenance → NetFlow.
     netflow_port: int = 2055
 
-    # Sliding window (seconds) over which NetFlow per-device byte counts are
-    # averaged into a live bits-per-second rate. MUST be ≥ the router's NetFlow
-    # "Active Timeout" (System Maintenance → NetFlow; min 60s on Vigor
-    # 2762/2765): the router exports a long-lived flow's bytes once per active
-    # timeout, so the window has to span at least one export or steady
-    # transfers read low and ripple. Larger = smoother but slower to react.
-    netflow_rate_window_s: float = 60.0
-
     # Comma-separated CIDR prefixes treated as "LAN" when attributing
     # NetFlow records. Defaults cover RFC1918 IPv4 + IPv6 ULA + IPv6
     # link-local. If your ISP routes a global IPv6 /64 to your LAN, add

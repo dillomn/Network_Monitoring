@@ -248,10 +248,14 @@ class NetflowCollector:
                 reason = "both_public"  # WAN↔WAN: not internet bandwidth
 
         if reason in ("outbound", "inbound"):
-            # duration_s is computed for diagnostics only (it surfaces in
-            # /api/netflow/recent and is exactly the value that, used as a rate
-            # denominator, produced phantom spikes). Rates no longer use it.
-            if rec.last_switched > rec.first_switched > 0:
+            # How long these bytes actually took, per the router's own clock.
+            # Prefer the absolute epoch-ms timestamps this Vigor exports (IPFIX
+            # 152/153); fall back to sysUptime-relative FIRST/LAST_SWITCHED
+            # (v9 21/22). Surfaced in /api/netflow/recent so we can confirm a
+            # download's end-of-flow lump really spans the whole transfer.
+            if rec.flow_end_ms > rec.flow_start_ms > 0:
+                duration_s = (rec.flow_end_ms - rec.flow_start_ms) / 1000.0
+            elif rec.last_switched > rec.first_switched > 0:
                 duration_s = (rec.last_switched - rec.first_switched) / 1000.0
             if mac is not None:
                 self.records_processed += 1
@@ -278,6 +282,7 @@ class NetflowCollector:
             "mac": mac,
             "tx_add": tx_add, "rx_add": rx_add,
             "duration_s": duration_s,
+            "flow_start_ms": rec.flow_start_ms, "flow_end_ms": rec.flow_end_ms,
             "src": rec.src, "dst": rec.dst,
             "src_mac": rec.src_mac, "dst_mac": rec.dst_mac,
             "src_port": rec.src_port, "dst_port": rec.dst_port,

@@ -44,6 +44,16 @@ F_IN_SRC_MAC = 56
 F_OUT_DST_MAC = 57
 F_IN_DST_MAC = 80
 F_OUT_SRC_MAC = 81
+# Absolute flow timestamps (IPFIX). The Vigor 2765 exports these INSTEAD of the
+# sysUptime-relative FIRST/LAST_SWITCHED (21/22) — which is why those came back
+# 0 and every record read as duration 0. Seconds and millisecond variants both
+# exist; we normalise everything to epoch-milliseconds. 323 is a single
+# observation timestamp (NAT-event template) with no separate start/end.
+F_FLOW_START_SECONDS = 150
+F_FLOW_END_SECONDS = 151
+F_FLOW_START_MS = 152
+F_FLOW_END_MS = 153
+F_OBSERVATION_TIME_MS = 323
 
 
 @dataclass
@@ -59,12 +69,16 @@ class FlowRecord:
     out_bytes: int = 0
     in_packets: int = 0
     out_packets: int = 0
-    # sysUpTime (ms since router boot) at the first/last packet of the
-    # flow. Their difference is the flow duration, which the collector
-    # uses as the rate denominator. Default 0 means "not supplied" and
-    # the collector falls back to its flush-window estimate.
+    # sysUpTime (ms since router boot) at the first/last packet of the flow
+    # (NetFlow v9, fields 21/22). 0 = not supplied.
     first_switched: int = 0
     last_switched: int = 0
+    # Absolute flow start/end in epoch-milliseconds, when the exporter supplies
+    # them (IPFIX 150-153 / 323). Preferred over first/last_switched because
+    # they need no sysUptime reference to interpret and pin the bytes to a real
+    # wall-clock interval. 0 = not supplied.
+    flow_start_ms: int = 0
+    flow_end_ms: int = 0
 
 
 # A template is a list of (field_type, field_length_bytes) tuples.
@@ -176,6 +190,17 @@ def _read_data_records(body: bytes, fields: Template) -> list[FlowRecord]:
                 rec.first_switched = int.from_bytes(chunk, "big")
             elif ftype == F_LAST_SWITCHED:
                 rec.last_switched = int.from_bytes(chunk, "big")
+            elif ftype == F_FLOW_START_MS:
+                rec.flow_start_ms = int.from_bytes(chunk, "big")
+            elif ftype == F_FLOW_END_MS:
+                rec.flow_end_ms = int.from_bytes(chunk, "big")
+            elif ftype == F_FLOW_START_SECONDS:
+                rec.flow_start_ms = int.from_bytes(chunk, "big") * 1000
+            elif ftype == F_FLOW_END_SECONDS:
+                rec.flow_end_ms = int.from_bytes(chunk, "big") * 1000
+            elif ftype == F_OBSERVATION_TIME_MS:
+                # Single timestamp (NAT-event template): no separate start/end.
+                rec.flow_start_ms = rec.flow_end_ms = int.from_bytes(chunk, "big")
             # Other field types are silently skipped (still consume bytes via flen).
         records.append(rec)
         pos += rec_size

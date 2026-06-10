@@ -9,7 +9,25 @@ Built and tested against the **Vigor 2762n** and **Vigor 2765 series**.
 - Listens on UDP/2055 for NetFlow v9 records from the router and credits each flow's bytes to the LAN-side IP for per-device bandwidth (see the accuracy caveat under *Verifying NetFlow is flowing*)
 - Logs into the DrayTek over SSH for `srv dhcp status` + `ip arp status` (device list, hostnames, vendor) and `show statistic` (per-WAN cumulative byte counters → live WAN bps via deltas)
 - Stores samples in SQLite (default 30-day retention)
-- Web UI at `http://<pi-ip>:8090` with sortable device list, live WAN totals, and historical graphs
+- Web UI at `http://<pi-ip>:8090` with sortable device list, live WAN totals, and historical graphs.
+  The device list leads with **exact transfer volumes** (last 1h / 24h) — rates are estimates
+  (see *Reading the numbers* below), volumes are conserved byte counts. Devices with open NAT
+  sessions but no flow data yet show **“in progress…”** instead of a false 0 bps, and charts
+  shade the trailing ~2 minutes where flow records may not have arrived yet.
+
+### Reading the numbers
+
+The router exports a flow's **total bytes + start/end time only when the flow ends** (its
+Active Timeout doesn't chop ongoing flows — see DrayTek setup below). Consequences:
+
+- **Volumes (1h/24h columns, the per-bin bar chart) are exact** — they sum to what the flow
+  records reported.
+- **Rate lines are estimates**: bytes are spread uniformly across each flow's span, so a long
+  download that ran fast-then-slow draws as a flat average. Short flows (most traffic, expired
+  ≤15 s after going idle) are nearly true-to-shape.
+- **Nothing about a long transfer is visible until it finishes** — it then backfills the charts
+  at the right place and rate. The "in progress…" badge (open NAT sessions, no fresh samples)
+  is the live hint that a device is doing something unmeasured.
 - **Settings ⚙** (header gear) opens a troubleshooting panel that runs live checks — router reachable, SSH auth, NetFlow ingest/attribution, DB — backed by `/api/diagnostics`
 
 > **Data sources at a glance:** per-device traffic comes **only** from NetFlow. SSH supplies device identity (DHCP/ARP), WAN totals (`show statistic`), and the NAT port-map — it does **not** measure per-device traffic. The `show traffic <ip>` CLI path survives solely in the `/debug/ssh/*` endpoints for cross-checking.

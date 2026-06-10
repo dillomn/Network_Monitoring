@@ -19,6 +19,7 @@ or inside the container:
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 # Allow running both as `python -m unittest tests.test_netflow_rate` from the
@@ -166,6 +167,59 @@ class UpsertAddTest(unittest.TestCase):
         by_ts = {p["ts"]: (p["tx_bps"], p["rx_bps"]) for p in pts}
         self.assertEqual(by_ts[1000], (15.0, 150.0))
         self.assertEqual(by_ts[1010], (1.0, 2.0))
+
+
+class VolumeTest(unittest.TestCase):
+    """The volume queries must exactly invert the rate buckets: each sample row
+    is a bps rate over one SAMPLE_BUCKET_S bucket, so bytes = bps × bucket ÷ 8.
+    These are the numbers the UI presents as exact, so they must conserve."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self._real_path = db.settings.db_path
+        db.settings.db_path = self.tmp.name
+        db.init_db()
+
+    def tearDown(self) -> None:
+        db.settings.db_path = self._real_path
+        os.unlink(self.tmp.name)
+
+    def test_usage_for_bins_and_inverts_rates(self) -> None:
+        b = db.SAMPLE_BUCKET_S
+        tx_bytes = 80.0 * b / 8   # one bucket's worth at 80 bps
+        rx_bytes = 800.0 * b / 8
+        db.add_samples([("AA", 3600, 80.0, 800.0)])
+        db.add_samples([("AA", 3600 + b, 80.0, 800.0)])  # same hour bin
+        db.add_samples([("AA", 7200, 80.0, 0.0)])        # next hour bin
+        pts = db.usage_for("AA", 0, 3600)
+        by = {p["ts"]: (p["tx_bytes"], p["rx_bytes"]) for p in pts}
+        self.assertEqual(set(by), {3600, 7200})
+        self.assertAlmostEqual(by[3600][0], 2 * tx_bytes)
+        self.assertAlmostEqual(by[3600][1], 2 * rx_bytes)
+        self.assertAlmostEqual(by[7200][0], tx_bytes)
+        self.assertAlmostEqual(by[7200][1], 0.0)
+
+    def test_device_volume_windows(self) -> None:
+        b = db.SAMPLE_BUCKET_S
+        db.upsert_device("AA", "192.168.1.10", "thing")
+        now = int(time.time())
+        db.add_samples([("AA", now - 120, 8.0, 16.0)])    # inside 1h and 24h
+        db.add_samples([("AA", now - 7200, 8.0, 0.0)])    # inside 24h only
+        db.add_samples([("AA", now - 90000, 8.0, 0.0)])   # >24h old — excluded
+        d = {r["mac"]: r for r in db.list_devices_with_current()}["AA"]
+        self.assertAlmostEqual(d["vol_tx_1h"], 8.0 * b / 8)
+        self.assertAlmostEqual(d["vol_rx_1h"], 16.0 * b / 8)
+        self.assertAlmostEqual(d["vol_tx_24h"], 2 * 8.0 * b / 8)
+        self.assertAlmostEqual(d["vol_rx_24h"], 16.0 * b / 8)
+
+    def test_device_without_samples_has_zero_volumes(self) -> None:
+        db.upsert_device("BB", "192.168.1.11", "idle-thing")
+        d = {r["mac"]: r for r in db.list_devices_with_current()}["BB"]
+        self.assertEqual(d["vol_tx_1h"], 0.0)
+        self.assertEqual(d["vol_rx_1h"], 0.0)
+        self.assertEqual(d["vol_tx_24h"], 0.0)
+        self.assertEqual(d["vol_rx_24h"], 0.0)
 
 
 if __name__ == "__main__":

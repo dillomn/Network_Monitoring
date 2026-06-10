@@ -171,6 +171,18 @@ class Poller:
         NetFlow record, return the real LAN IP (or None if not in table)."""
         return self._portmap.get((pseudo_ip, pseudo_port))
 
+    def sessions_by_ip(self) -> dict[str, int]:
+        """Active NAT sessions per LAN IP, from the portmap snapshot. Used by
+        the UI to flag devices that have open connections but no flow data yet
+        — the router exports a long transfer only when it ends, so "0 bps with
+        open sessions" means *unmeasured*, not idle. Heuristic: NAT entries
+        linger a while after a connection closes, so a recently-idle device can
+        still show sessions."""
+        out: dict[str, int] = {}
+        for priv_ip in self._portmap.values():
+            out[priv_ip] = out.get(priv_ip, 0) + 1
+        return out
+
     async def _maybe_update_portmap(self, session: DraytekSession) -> None:
         """Refresh the NAT port-map on a slower cadence than discovery —
         `show portmap` can return thousands of rows on a busy router, so we

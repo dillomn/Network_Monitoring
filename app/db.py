@@ -49,6 +49,13 @@ CREATE INDEX IF NOT EXISTS idx_wan_samples_ts ON wan_samples(ts);
 # seconds with no sample we report it as idle (0) instead of a stale rate.
 CURRENT_STALE_S = 30
 
+# Width of one sample bucket, in seconds. Canonical definition — the NetFlow
+# collector spreads each flow's bytes across buckets of this width and stores a
+# bps rate per (mac, bucket); the volume queries below invert that
+# (bytes = bps × SAMPLE_BUCKET_S ÷ 8). Keep the two sides in lockstep or
+# volume totals will silently scale wrong.
+SAMPLE_BUCKET_S = 10
+
 
 def init_db() -> None:
     Path(settings.db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -135,6 +142,8 @@ def add_samples(rows: list[tuple[str, int, float, float]]) -> None:
 
 
 def list_devices_with_current() -> list[dict]:
+    now = int(time.time())
+    h1, h24 = now - 3600, now - 86400
     with conn() as c:
         rows = c.execute(
             """
@@ -147,7 +156,23 @@ def list_devices_with_current() -> list[dict]:
             ORDER BY (tx_bps + rx_bps) DESC NULLS LAST, d.hostname
             """
         ).fetchall()
-    now = int(time.time())
+        # Exact transfer volumes over the trailing 1h/24h windows. Each sample
+        # row is a rate over one SAMPLE_BUCKET_S bucket, so bytes come back out
+        # as rate × bucket ÷ 8. Unlike the "current" rate (which is an estimate
+        # shaped by the uniform-spread assumption), these sums are conserved —
+        # they equal what the flow records actually reported.
+        vols = c.execute(
+            """
+            SELECT mac,
+                   SUM(CASE WHEN ts >= :h1 THEN tx_bps ELSE 0 END) * :w / 8.0 AS vol_tx_1h,
+                   SUM(CASE WHEN ts >= :h1 THEN rx_bps ELSE 0 END) * :w / 8.0 AS vol_rx_1h,
+                   SUM(tx_bps) * :w / 8.0 AS vol_tx_24h,
+                   SUM(rx_bps) * :w / 8.0 AS vol_rx_24h
+            FROM samples WHERE ts >= :h24 GROUP BY mac
+            """,
+            {"h1": h1, "h24": h24, "w": SAMPLE_BUCKET_S},
+        ).fetchall()
+    vol_by_mac = {v["mac"]: v for v in vols}
     out = []
     for r in rows:
         d = dict(r)
@@ -157,6 +182,11 @@ def list_devices_with_current() -> list[dict]:
         if ls is None or now - ls > CURRENT_STALE_S:
             d["tx_bps"] = 0.0
             d["rx_bps"] = 0.0
+        v = vol_by_mac.get(d["mac"])
+        d["vol_tx_1h"] = v["vol_tx_1h"] if v else 0.0
+        d["vol_rx_1h"] = v["vol_rx_1h"] if v else 0.0
+        d["vol_tx_24h"] = v["vol_tx_24h"] if v else 0.0
+        d["vol_rx_24h"] = v["vol_rx_24h"] if v else 0.0
         out.append(d)
     return out
 
@@ -187,6 +217,26 @@ def history_for(mac: str, since_ts: int) -> list[dict]:
             (mac, since_ts),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def usage_for(mac: str, since_ts: int, bucket_s: int) -> list[dict]:
+    """Transfer volume per `bucket_s`-wide bin: [{ts, tx_bytes, rx_bytes}].
+    `ts` is the bin start (epoch, aligned to bucket_s). Bins with no samples
+    are omitted. Volumes are exact (see list_devices_with_current) — this is
+    the honest "when did the bytes move" view, vs. the rate chart whose shape
+    inside a long flow is a uniform-spread estimate."""
+    with conn() as c:
+        rows = c.execute(
+            """
+            SELECT (ts / :b) * :b AS bucket,
+                   SUM(tx_bps) * :w / 8.0 AS tx_bytes,
+                   SUM(rx_bps) * :w / 8.0 AS rx_bytes
+            FROM samples WHERE mac = :mac AND ts >= :since
+            GROUP BY bucket ORDER BY bucket ASC
+            """,
+            {"b": int(bucket_s), "w": SAMPLE_BUCKET_S, "mac": mac, "since": since_ts},
+        ).fetchall()
+    return [{"ts": r["bucket"], "tx_bytes": r["tx_bytes"], "rx_bytes": r["rx_bytes"]} for r in rows]
 
 
 def prune_old_samples(retention_days: int) -> int:

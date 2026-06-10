@@ -57,7 +57,10 @@ FLUSH_INTERVAL_S = 5.0
 # / 283 s download read as a ~200 Mbps spike at the moment it stopped. Placing
 # each flow's bytes in the buckets it actually spanned reconstructs the true
 # rate (~45 Mbps) at the true time.
-SAMPLE_BUCKET_S = 10
+#
+# Canonical value lives in db.py: the volume queries there invert this rate
+# back into bytes, so the two must agree.
+SAMPLE_BUCKET_S = db.SAMPLE_BUCKET_S
 
 # Cap how far back a single flow's bytes are spread. Guards against a glitched
 # flow_start (a flow that reads as "open since boot", or a router clock jump)

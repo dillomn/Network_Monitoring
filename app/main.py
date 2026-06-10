@@ -303,9 +303,22 @@ async def wan_history_api(wan: str = Query(...), hours: int = Query(24, ge=1, le
 @app.get("/api/devices")
 async def devices() -> list[dict]:
     rows = db.list_devices_with_current()
+    sessions = poller.sessions_by_ip()
+    now = int(time.time())
     for r in rows:
         if not r.get("vendor"):
             r["vendor"] = oui.lookup(r["mac"])
+        # rate_pending: open NAT sessions but no fresh sample bucket. The
+        # router exports a long flow only when it ends, so this device may be
+        # mid-transfer and unmeasured — the UI shows "pending" instead of a
+        # false 0 bps. Limits: NAT entries linger after close (false
+        # positive), and a long flow plus background chatter keeps buckets
+        # fresh, hiding the badge (false negative). Honest hint, not a meter.
+        n = sessions.get(r.get("ip") or "", 0)
+        ls = r.get("last_sample")
+        fresh = ls is not None and now - ls <= db.CURRENT_STALE_S
+        r["active_sessions"] = n
+        r["rate_pending"] = n > 0 and not fresh
     return rows
 
 
@@ -314,6 +327,21 @@ async def history(mac: str, hours: int = Query(24, ge=1, le=24 * 30)) -> dict:
     since = int(time.time()) - hours * 3600
     points = db.history_for(mac.upper(), since)
     return {"mac": mac.upper(), "since": since, "points": points}
+
+
+@app.get("/api/devices/{mac}/usage")
+async def usage(
+    mac: str,
+    hours: int = Query(24, ge=1, le=24 * 30),
+    bucket_s: int = Query(3600, ge=60, le=86400),
+) -> dict:
+    """Transfer volume per time bin — the exact "who used how much, when"
+    view. Unlike /history (a rate whose shape inside a long flow is a
+    uniform-spread estimate), these sums equal what the flow records
+    reported."""
+    since = int(time.time()) - hours * 3600
+    points = db.usage_for(mac.upper(), since, bucket_s)
+    return {"mac": mac.upper(), "since": since, "bucket_s": bucket_s, "points": points}
 
 
 class NoteIn(BaseModel):

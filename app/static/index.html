@@ -30,14 +30,18 @@
           <col class="col-mac" />
           <col class="col-rate" />
           <col class="col-rate" />
+          <col class="col-vol" />
+          <col class="col-vol" />
         </colgroup>
         <thead>
           <tr>
             <th class="sortable" data-sort="hostname">Device <span class="sort-ind"></span></th>
             <th class="sortable" data-sort="ip">IP <span class="sort-ind"></span></th>
             <th class="sortable" data-sort="mac">MAC <span class="sort-ind"></span></th>
-            <th class="sortable num" data-sort="tx_bps">TX <span class="parens">(upload)</span><span class="sort-ind"></span></th>
-            <th class="sortable num" data-sort="rx_bps">RX <span class="parens">(download)</span><span class="sort-ind"></span></th>
+            <th class="sortable num" data-sort="tx_bps">TX <span class="parens">(now)</span><span class="sort-ind"></span></th>
+            <th class="sortable num" data-sort="rx_bps">RX <span class="parens">(now)</span><span class="sort-ind"></span></th>
+            <th class="sortable num" data-sort="vol_1h" title="Bytes transferred in the last hour (exact)">1h <span class="parens">(vol)</span><span class="sort-ind"></span></th>
+            <th class="sortable num" data-sort="vol_24h" title="Bytes transferred in the last 24 hours (exact)">24h <span class="parens">(vol)</span><span class="sort-ind"></span></th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -93,7 +97,12 @@
           <button id="m-save-note">Save</button>
         </label>
       </div>
-      <div class="chart-wrap big"><canvas id="m-chart"></canvas></div>
+      <div class="modal-body">
+        <h3 class="chart-sub">Volume <span class="parens" id="m-usage-note">— exact bytes moved per bin</span></h3>
+        <div class="chart-wrap usage"><canvas id="m-usage-chart"></canvas></div>
+        <h3 class="chart-sub">Rate <span class="parens">— shape inside a long transfer is an average, not measured</span></h3>
+        <div class="chart-wrap big"><canvas id="m-chart"></canvas></div>
+      </div>
     </div>
   </div>
 

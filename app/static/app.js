@@ -22,6 +22,33 @@ const fmtRateInUnit = (bps, unit) => {
   return `${v.toFixed(digits)} ${unit.label}`;
 };
 
+// Transfer volumes (bytes). Unlike the rates, these are exact — the per-bucket
+// sums equal what the router's flow records reported.
+const fmtBytes = (b) => {
+  if (!b || b < 1) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (b >= 1000 && i < units.length - 1) { b /= 1000; i++; }
+  return `${b.toFixed(i === 0 || b >= 100 ? 0 : b >= 10 ? 1 : 2)} ${units[i]}`;
+};
+
+const pickByteUnit = (maxBytes) => {
+  if (maxBytes >= 1e12) return { divisor: 1e12, label: "TB" };
+  if (maxBytes >= 1e9) return { divisor: 1e9, label: "GB" };
+  if (maxBytes >= 1e6) return { divisor: 1e6, label: "MB" };
+  if (maxBytes >= 1e3) return { divisor: 1e3, label: "KB" };
+  return { divisor: 1, label: "B" };
+};
+
+const fmtBytesInUnit = (b, unit) => {
+  const v = (b || 0) / unit.divisor;
+  const digits = v >= 100 || unit.divisor === 1 ? 0 : v >= 10 ? 1 : 2;
+  return `${v.toFixed(digits)} ${unit.label}`;
+};
+
+const vol1h = (d) => (d.vol_tx_1h || 0) + (d.vol_rx_1h || 0);
+const vol24h = (d) => (d.vol_tx_24h || 0) + (d.vol_rx_24h || 0);
+
 const fmtTime = (ts) => {
   if (!ts) return "—";
   return new Date(ts * 1000).toLocaleString();
@@ -34,11 +61,14 @@ const escapeHtml = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({
 let devices = [];
 let mainChart = null;
 let modalChart = null;
+let modalUsageChart = null;
 let selectedMac = null;
-let sortKey = "tx_bps";
+// Default sort: 24h volume. Volume is the exact measurement (who consumed a
+// lot), current rate is the estimate (and reads 0 mid-long-flow).
+let sortKey = "vol_24h";
 let sortDir = "desc"; // "asc" | "desc"
 
-const SORT_KEYS = new Set(["hostname", "ip", "mac", "tx_bps", "rx_bps"]);
+const SORT_KEYS = new Set(["hostname", "ip", "mac", "tx_bps", "rx_bps", "vol_1h", "vol_24h"]);
 
 async function fetchJSON(url) {
   const r = await fetch(url);
@@ -90,6 +120,8 @@ function sortValue(d, key) {
     return parts[0] * (1 << 24) + parts[1] * (1 << 16) + parts[2] * 256 + parts[3];
   }
   if (key === "mac") return (d.mac || "").toLowerCase();
+  if (key === "vol_1h") return vol1h(d);
+  if (key === "vol_24h") return vol24h(d);
   return d[key] || 0;
 }
 
@@ -121,7 +153,7 @@ function updateSortIndicators() {
 function renderDeviceTable() {
   const filter = document.getElementById("filter").value.toLowerCase();
   const tbody = document.querySelector("#device-table tbody");
-  const max = Math.max(1, ...devices.map(d => (d.tx_bps || 0) + (d.rx_bps || 0)));
+  const maxVol = Math.max(1, ...devices.map(vol24h));
   const filtered = devices.filter(d => {
     if (!filter) return true;
     return (d.hostname || "").toLowerCase().includes(filter)
@@ -131,20 +163,27 @@ function renderDeviceTable() {
   });
   const rows = applySort(filtered)
     .map(d => {
-      const total = (d.tx_bps || 0) + (d.rx_bps || 0);
-      const barW = Math.min(60, Math.round((total / max) * 60));
       const name = escapeHtml(d.hostname || "(unknown)");
       const vendor = d.vendor ? `<div class="vendor">${escapeHtml(d.vendor)}</div>` : "";
+      // Open NAT sessions but no fresh flow data: the router only exports a
+      // long transfer when it finishes, so the rate is unknown — say so
+      // instead of showing a false 0 bps.
+      const rateCells = d.rate_pending
+        ? `<td class="num" colspan="2"><span class="pending" title="${d.active_sessions} open NAT session(s) but no flow data — the router reports a long transfer only when it finishes">in progress…</span></td>`
+        : `<td class="num"><span class="rate">${fmtRate(d.tx_bps)}</span></td>
+           <td class="num"><span class="rate">${fmtRate(d.rx_bps)}</span></td>`;
+      const barW = Math.round((vol24h(d) / maxVol) * 100);
       return `<tr data-mac="${escapeHtml(d.mac)}" class="${d.mac === selectedMac ? "active" : ""}">
         <td class="device-cell"><div class="hostname">${name}</div>${vendor}</td>
         <td class="ip">${escapeHtml(d.ip || "")}</td>
         <td class="mac">${escapeHtml(d.mac)}</td>
-        <td class="num"><span class="rate">${fmtRate(d.tx_bps)}</span><span class="bar" style="width:${barW}px"></span></td>
-        <td class="num"><span class="rate">${fmtRate(d.rx_bps)}</span></td>
+        ${rateCells}
+        <td class="num"><span class="vol">${fmtBytes(vol1h(d))}</span></td>
+        <td class="num"><span class="vol">${fmtBytes(vol24h(d))}</span><span class="bar" style="width:${barW}%"></span></td>
       </tr>`;
     })
     .join("");
-  tbody.innerHTML = rows || `<tr><td colspan="5" style="text-align:center;padding:20px;color:var(--muted)">No devices yet. Waiting for first poll…</td></tr>`;
+  tbody.innerHTML = rows || `<tr><td colspan="7" style="text-align:center;padding:20px;color:var(--muted)">No devices yet. Waiting for first poll…</td></tr>`;
   tbody.querySelectorAll("tr[data-mac]").forEach(tr => {
     tr.addEventListener("click", () => openDeviceModal(tr.dataset.mac));
   });
@@ -157,8 +196,15 @@ function renderDeviceTable() {
 // hour look like sustained traffic. Insert explicit zeros at the edges of any
 // gap wider than GAP_S so the line drops to 0 between bursts.
 const GAP_S = 30;
+
+// Trailing window where data is still incomplete: flow records for anything
+// in-flight haven't been exported yet (a long transfer arrives only when it
+// ends and is then backfilled). Charts shade this region so the right edge
+// isn't read as "zero traffic".
+const LIVE_EDGE_S = 120;
+
 function fillGaps(points) {
-  if (points.length < 2) return points;
+  if (!points.length) return points;
   const out = [];
   for (let i = 0; i < points.length; i++) {
     const p = points[i];
@@ -168,8 +214,50 @@ function fillGaps(points) {
     }
     out.push(p);
   }
+  // Trailing edge: short flows export within seconds of ending, so a quiet
+  // stretch up to the live-edge window really was (close to) zero. Inside the
+  // window nothing is known yet — leave it blank under the shaded band rather
+  // than drawing zeros that may be backfilled away.
+  const nowS = Date.now() / 1000;
+  const last = out[out.length - 1];
+  if (nowS - LIVE_EDGE_S - last.ts > GAP_S) {
+    out.push({ ts: last.ts + 1, tx_bps: 0, rx_bps: 0 });
+    out.push({ ts: nowS - LIVE_EDGE_S, tx_bps: 0, rx_bps: 0 });
+  }
   return out;
 }
+
+// Chart.js inline plugin: translucent band over the last LIVE_EDGE_S where
+// flow records may not have arrived yet.
+const liveEdgePlugin = {
+  id: "liveEdge",
+  beforeDatasetsDraw(chart) {
+    const x = chart.scales.x;
+    if (!x) return;
+    const area = chart.chartArea;
+    const nowMs = Date.now();
+    const from = Math.max(x.getPixelForValue(nowMs - LIVE_EDGE_S * 1000), area.left);
+    const to = Math.min(x.getPixelForValue(nowMs), area.right);
+    if (to <= from) return;
+    const ctx = chart.ctx;
+    ctx.save();
+    ctx.fillStyle = "rgba(255, 204, 102, 0.08)";
+    ctx.fillRect(from, area.top, to - from, area.bottom - area.top);
+    ctx.strokeStyle = "rgba(255, 204, 102, 0.35)";
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(from, area.top);
+    ctx.lineTo(from, area.bottom);
+    ctx.stroke();
+    if (to - from > 80) {
+      ctx.fillStyle = "rgba(255, 204, 102, 0.85)";
+      ctx.font = "10px sans-serif";
+      ctx.textAlign = "right";
+      ctx.fillText("data still arriving", to - 5, area.top + 12);
+    }
+    ctx.restore();
+  },
+};
 
 function chartConfig(label, points) {
   points = fillGaps(points);
@@ -198,7 +286,9 @@ function chartConfig(label, points) {
     options: {
       responsive: true, maintainAspectRatio: false, animation: false,
       scales: {
-        x: { type: "time", time: { tooltipFormat: "MMM d, HH:mm:ss" },
+        // Extend the axis to "now" so the chart shows the (shaded) not-yet-
+        // reported window instead of ending at the last sample.
+        x: { type: "time", max: Date.now(), time: { tooltipFormat: "MMM d, HH:mm:ss" },
              ticks: { color: "#8a96a4" }, grid: { color: "rgba(255,255,255,0.05)" } },
         y: { ticks: { color: "#8a96a4", callback: (v) => fmtRateInUnit(v, yUnit) },
              title: { display: true, text: yUnit.label, color: "#8a96a4" },
@@ -210,26 +300,72 @@ function chartConfig(label, points) {
         tooltip: { callbacks: { label: (ctx) => `${ctx.dataset.label}: ${fmtRate(ctx.parsed.y)}` } },
       },
     },
+    plugins: [liveEdgePlugin],
+  };
+}
+
+// Volume-per-bin bar chart (modal). Bin width per range keeps the bar count
+// readable; the current (still-filling) bin is drawn faded.
+function usageChartConfig(points, bucketS) {
+  const nowBinMs = Math.floor(Date.now() / 1000 / bucketS) * bucketS * 1000;
+  const fade = (base, faded) => (ctx) => (ctx.raw && ctx.raw.x >= nowBinMs ? faded : base);
+  const peak = points.reduce((m, p) => Math.max(m, (p.tx_bytes || 0) + (p.rx_bytes || 0)), 0);
+  const yUnit = pickByteUnit(peak);
+  return {
+    type: "bar",
+    data: {
+      datasets: [
+        {
+          label: "TX (upload)",
+          data: points.map(p => ({ x: p.ts * 1000, y: p.tx_bytes })),
+          backgroundColor: fade("rgba(255,180,84,0.8)", "rgba(255,180,84,0.35)"),
+        },
+        {
+          label: "RX (download)",
+          data: points.map(p => ({ x: p.ts * 1000, y: p.rx_bytes })),
+          backgroundColor: fade("rgba(92,200,255,0.8)", "rgba(92,200,255,0.35)"),
+        },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      scales: {
+        x: { type: "time", stacked: true, offset: true,
+             time: { tooltipFormat: "MMM d, HH:mm" },
+             ticks: { color: "#8a96a4" }, grid: { color: "rgba(255,255,255,0.05)" } },
+        y: { stacked: true, beginAtZero: true,
+             ticks: { color: "#8a96a4", callback: (v) => fmtBytesInUnit(v, yUnit) },
+             title: { display: true, text: yUnit.label, color: "#8a96a4" },
+             grid: { color: "rgba(255,255,255,0.05)" } },
+      },
+      plugins: {
+        legend: { labels: { color: "#d7dee6" } },
+        tooltip: { callbacks: {
+          label: (ctx) => `${ctx.dataset.label}: ${fmtBytes(ctx.parsed.y)}`
+            + (ctx.parsed.x >= nowBinMs ? " (bin still filling)" : ""),
+        } },
+      },
+    },
   };
 }
 
 async function refreshMainChart() {
   const hours = parseInt(document.getElementById("range").value, 10);
-  const top = devices
-    .filter(d => (d.tx_bps || 0) + (d.rx_bps || 0) > 0)
-    .slice(0, 1);
+  // Pick the device that moved the most bytes in 24h — volume is the exact
+  // measurement. Picking by current rate made the chart go blank whenever
+  // rates were stale, and missed devices mid-long-flow (rate reads 0).
+  const dev = devices.slice().sort((a, b) => vol24h(b) - vol24h(a))[0];
 
   const ctx = document.getElementById("main-chart").getContext("2d");
-  if (top.length === 0) {
-    document.getElementById("chart-title").textContent = `Top talker — last ${hours}h (waiting for data)`;
+  if (!dev || vol24h(dev) <= 0) {
+    document.getElementById("chart-title").textContent = `Top consumer — last ${hours}h (waiting for data)`;
     if (mainChart) mainChart.destroy();
     mainChart = null;
     return;
   }
-  const dev = top[0];
   const data = await fetchJSON(`/api/devices/${encodeURIComponent(dev.mac)}/history?hours=${hours}`);
   document.getElementById("chart-title").textContent =
-    `Top talker — ${dev.hostname || dev.mac} (last ${hours}h)`;
+    `Top consumer — ${dev.hostname || dev.mac} (${fmtBytes(vol24h(dev))} in 24h, last ${hours}h)`;
   if (mainChart) mainChart.destroy();
   mainChart = new Chart(ctx, chartConfig(null, data.points));
 }
@@ -239,12 +375,17 @@ function updateModalHeader(d) {
   document.getElementById("m-ip").textContent = `IP ${d.ip || "?"}`;
   document.getElementById("m-mac").textContent = `MAC ${d.mac}`;
   document.getElementById("m-vendor").textContent = d.vendor ? `Vendor ${d.vendor}` : "Vendor unknown";
-  document.getElementById("m-tx").textContent = fmtRate(d.tx_bps);
-  document.getElementById("m-rx").textContent = fmtRate(d.rx_bps);
+  document.getElementById("m-tx").textContent = d.rate_pending ? "in progress…" : fmtRate(d.tx_bps);
+  document.getElementById("m-rx").textContent = d.rate_pending ? "in progress…" : fmtRate(d.rx_bps);
   document.getElementById("m-first").textContent = fmtTime(d.first_seen);
   document.getElementById("m-last").textContent = fmtTime(d.last_seen);
   document.getElementById("m-note").value = d.notes || "";
 }
+
+// Bin width per range for the volume bars — enough bars to see "when"
+// without becoming a comb.
+const USAGE_BUCKET_S = { 1: 300, 6: 1800, 24: 3600, 168: 21600, 720: 86400 };
+const USAGE_BUCKET_LABEL = { 1: "5 min", 6: "30 min", 24: "hour", 168: "6 h", 720: "day" };
 
 async function refreshModalChart() {
   if (!selectedMac) return;
@@ -255,12 +396,25 @@ async function refreshModalChart() {
   modalChart = new Chart(ctx, chartConfig(null, data.points));
 }
 
+async function refreshModalUsage() {
+  if (!selectedMac) return;
+  const hours = parseInt(document.getElementById("m-range").value, 10);
+  const bucketS = USAGE_BUCKET_S[hours] || 3600;
+  const data = await fetchJSON(
+    `/api/devices/${encodeURIComponent(selectedMac)}/usage?hours=${hours}&bucket_s=${bucketS}`);
+  document.getElementById("m-usage-note").textContent =
+    `— exact bytes moved per ${USAGE_BUCKET_LABEL[hours] || "bin"}; faded bar = bin still filling`;
+  const ctx = document.getElementById("m-usage-chart").getContext("2d");
+  if (modalUsageChart) modalUsageChart.destroy();
+  modalUsageChart = new Chart(ctx, usageChartConfig(data.points, bucketS));
+}
+
 async function openDeviceModal(mac) {
   selectedMac = mac;
   const d = devices.find(x => x.mac === mac);
   if (d) updateModalHeader(d);
   document.getElementById("modal").classList.remove("hidden");
-  await refreshModalChart();
+  await Promise.all([refreshModalChart(), refreshModalUsage()]);
   renderDeviceTable();
 }
 
@@ -268,6 +422,7 @@ function closeModal() {
   document.getElementById("modal").classList.add("hidden");
   selectedMac = null;
   if (modalChart) { modalChart.destroy(); modalChart = null; }
+  if (modalUsageChart) { modalUsageChart.destroy(); modalUsageChart = null; }
   renderDeviceTable();
 }
 
@@ -277,7 +432,10 @@ document.getElementById("modal").addEventListener("click", (e) => {
 });
 document.getElementById("filter").addEventListener("input", renderDeviceTable);
 document.getElementById("range").addEventListener("change", refreshMainChart);
-document.getElementById("m-range").addEventListener("change", refreshModalChart);
+document.getElementById("m-range").addEventListener("change", () => {
+  refreshModalChart();
+  refreshModalUsage();
+});
 document.getElementById("m-save-note").addEventListener("click", async () => {
   if (!selectedMac) return;
   const note = document.getElementById("m-note").value;
@@ -345,7 +503,7 @@ document.querySelectorAll("#device-table th.sortable").forEach(th => {
       sortDir = sortDir === "asc" ? "desc" : "asc";
     } else {
       sortKey = k;
-      sortDir = (k === "tx_bps" || k === "rx_bps") ? "desc" : "asc";
+      sortDir = (k === "tx_bps" || k === "rx_bps" || k === "vol_1h" || k === "vol_24h") ? "desc" : "asc";
     }
     renderDeviceTable();
   });
@@ -353,7 +511,7 @@ document.querySelectorAll("#device-table th.sortable").forEach(th => {
 
 async function tick() {
   await Promise.all([refreshHealth(), refreshDevices()]);
-  if (selectedMac) await refreshModalChart();
+  if (selectedMac) await Promise.all([refreshModalChart(), refreshModalUsage()]);
   await refreshMainChart();
 }
 

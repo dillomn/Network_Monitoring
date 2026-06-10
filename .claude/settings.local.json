@@ -73,7 +73,11 @@
       "Bash(rm -f /tmp/netmon_test.db /tmp/draymon_test.log)",
       "Bash(rm -rf /tmp/draymon-venv /tmp/pdfvenv /tmp/draytek_cli.txt)",
       "Bash(bash -n diag.sh)",
-      "PowerShell(foreach\\($c in 'py','python','python3','docker'\\){ $cmd=Get-Command $c -ErrorAction SilentlyContinue; if\\($cmd\\){ \"{0} -> {1}\" -f $c,$cmd.Source } else { \"$c -> missing\" } })"
+      "PowerShell(foreach\\($c in 'py','python','python3','docker'\\){ $cmd=Get-Command $c -ErrorAction SilentlyContinue; if\\($cmd\\){ \"{0} -> {1}\" -f $c,$cmd.Source } else { \"$c -> missing\" } })",
+      "PowerShell(python -m unittest tests.test_netflow_rate -v)",
+      "PowerShell(py -m unittest tests.test_netflow_rate -v)",
+      "PowerShell(docker --version)",
+      "PowerShell(node --version)"
     ],
     "additionalDirectories": [
       "c:\\Users\\DillonBrooks\\CCTS\\Shared - Documents\\Team\\SD Technicians\\AutomatedSlaveSuite\\Docker\\Network_Monitoring\\prometheus"

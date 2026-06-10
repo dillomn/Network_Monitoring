@@ -52,10 +52,11 @@ main {
 }
 
 table { width: 100%; border-collapse: collapse; table-layout: fixed; }
-.col-device { width: 24%; }
-.col-ip { width: 16%; }
-.col-mac { width: 22%; }
-.col-rate { width: 19%; }
+.col-device { width: 20%; }
+.col-ip { width: 13%; }
+.col-mac { width: 17%; }
+.col-rate { width: 13%; }
+.col-vol { width: 12%; }
 thead th {
   position: sticky; top: 0; background: var(--panel-2); text-align: left;
   font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
@@ -98,11 +99,26 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .device-cell .vendor { font-weight: 400; color: var(--muted); font-size: 11px; margin-top: 2px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .num .rate { display: inline-block; }
-.bar { display: inline-block; height: 4px; background: var(--accent); border-radius: 2px;
-  vertical-align: middle; margin-left: 6px; max-width: 60px; }
+.num .vol { display: inline-block; }
+.bar { display: block; height: 3px; background: var(--accent); border-radius: 2px;
+  margin-top: 3px; margin-left: auto; max-width: 100%; }
+/* Open NAT sessions but no flow data yet — the router only exports a long
+   transfer when it finishes, so the rate is unknown, not zero. */
+.pending {
+  color: var(--warn); font-size: 11px; font-weight: 600;
+  letter-spacing: 0.04em; cursor: help;
+}
 
 .chart-wrap { flex: 1; padding: 12px; min-height: 0; position: relative; }
-.chart-wrap.big { min-height: 360px; }
+.chart-wrap.big { min-height: 280px; }
+.chart-wrap.usage { flex: 0 0 auto; height: 200px; min-height: 200px; }
+.chart-sub {
+  margin: 0; padding: 10px 22px 0; font-size: 12px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted);
+}
+.chart-sub .parens { font-size: 10px; text-transform: none; font-weight: normal;
+  opacity: 0.75; letter-spacing: 0; }
+.modal-body { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
 
 .modal { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex;
   align-items: center; justify-content: center; padding: 20px; z-index: 100; }

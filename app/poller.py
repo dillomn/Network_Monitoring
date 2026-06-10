@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 
 import asyncssh
@@ -66,6 +67,14 @@ class Poller:
         # these over NetFlow-derived rates because the flow exporter says
         # nothing about a transfer until it ends.
         self.live_rates: dict[str, tuple[float, float, int]] = {}
+        # Recent reading history per device: {mac: deque[(ts, tx_bps, rx_bps)]}.
+        # The NetFlow collector uses this as the measured rate PROFILE when a
+        # flow-end record arrives: instead of spreading the flow's bytes
+        # uniformly over its duration, it distributes them proportionally to
+        # these readings — measured shape, exact total. Zero readings are kept
+        # on purpose (a measured zero shapes the profile too). ~6 h at one
+        # reading per 10 s.
+        self.live_history: dict[str, deque] = {}
         self.dfm_last_ts: int = 0
         # IPs still to poll in the current DFM rotation pass.
         self._dfm_rotation: list[str] = []
@@ -207,6 +216,8 @@ class Poller:
         f = flows[0]
         now = int(time.time())
         self.live_rates[mac] = (f.tx_bps, f.rx_bps, now)
+        hist = self.live_history.setdefault(mac, deque(maxlen=2200))
+        hist.append((now, f.tx_bps, f.rx_bps))
         self.dfm_last_ts = now
         if f.tx_bps > 0 or f.rx_bps > 0:
             bucket = now - (now % db.SAMPLE_BUCKET_S)

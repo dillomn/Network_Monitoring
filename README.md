@@ -23,9 +23,14 @@ Active Timeout doesn't chop ongoing flows — see DrayTek setup below). Conseque
 - **Volumes (1h/24h columns, the bar charts) are exact where NetFlow reported** and
   live-estimated where only Data Flow Monitor readings exist (a transfer still in
   progress, or a flow the exporter never sent).
-- **Rate lines are estimates**: NetFlow bytes are spread uniformly across each flow's span,
-  so a long download that ran fast-then-slow draws as a flat average. Short flows (most
-  traffic, expired ≤15 s after going idle) are nearly true-to-shape.
+- **Rate lines follow the measured shape where possible**: when a flow-end record arrives,
+  its bytes are distributed across the flow's span *proportionally to the Data Flow Monitor
+  readings* taken while it ran — a download that ran 100 Mbps then 5 Mbps charts as exactly
+  that. The flow record anchors the exact total (the weights are normalised, so even a
+  miscalibrated `TRAFFIC_UNIT` only affects shape, never magnitude). Only when no readings
+  cover the window (device wasn't in the DFM rotation) does it fall back to a flat average.
+  `flows_spread_shaped` vs `flows_spread_uniform` in `/api/netflow/stats` shows which path
+  flows are taking.
 - **Long transfers are visible live** via the Data Flow Monitor readings (green dot next to
   the rate = live reading); when the flow record finally exports, its exact figures replace
   the estimates. A wrong `TRAFFIC_UNIT` scales every live reading — calibrate via

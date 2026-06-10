@@ -65,7 +65,10 @@ def _lan_record(out_bytes: int = 0, in_bytes: int = 0,
     )
 
 
-class SpreadTest(unittest.TestCase):
+class _CollectorTestBase(unittest.TestCase):
+    """Shared fixture: fake clock, captured add_samples, fresh collector.
+    No test methods of its own — subclasses add them."""
+
     def setUp(self) -> None:
         self.clock = FakeClock()
         self._real_time = nf.time
@@ -85,6 +88,8 @@ class SpreadTest(unittest.TestCase):
         """rate values written, by bucket ts -> rx_bps (after _flush)."""
         return {ts: rx for (_mac, ts, _tx, rx) in self.rows}
 
+
+class SpreadTest(_CollectorTestBase):
     def test_long_download_is_spread_not_spiked(self) -> None:
         # 1.586 GB downloaded over 283 s, exported as ONE record at flow end.
         total = 1_586_000_000
@@ -141,6 +146,68 @@ class SpreadTest(unittest.TestCase):
         self.c._flush()
         self.assertEqual(self.rows, [])
         self.assertEqual(self.c._pending, {})  # cleared, can't grow unbounded
+
+
+class ProfiledSpreadTest(_CollectorTestBase):
+    """When the poller's Data Flow Monitor history covers a flow's window, the
+    collector must distribute the flow's bytes proportionally to the MEASURED
+    rates — not uniformly. The flow record still anchors the exact total."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from collections import deque
+        from app import poller as poller_module
+        self._poller = poller_module.poller
+        self.flow_start = ARRIVAL_TS - 120
+        # Readings every 10 s: first minute ~100 Mbps down, second ~5 Mbps.
+        readings = []
+        for k in range(1, 13):
+            ts = self.flow_start + 10 * k
+            rx = 100e6 if k <= 6 else 5e6
+            readings.append((ts, 0.0, rx))
+        self._poller.live_history[LAN_MAC] = deque(readings)
+
+    def tearDown(self) -> None:
+        self._poller.live_history.clear()
+        super().tearDown()
+
+    def test_spread_follows_measured_profile(self) -> None:
+        # 787.5 MB over 120 s = the integral of the profile above.
+        total = 787_500_000
+        self.c._attribute(_lan_record(
+            out_bytes=total, flow_start_ms=1_000_000, flow_end_ms=1_000_000 + 120_000,
+        ))
+        self.c._flush()
+        rx = self._rx_at()
+
+        # Conservation: the measured shape redistributes, never resizes.
+        bytes_back = sum(v * self.bucket / 8 for v in rx.values())
+        self.assertAlmostEqual(bytes_back, total, delta=total * 0.001)
+
+        # Shape: an early bucket reads near 100 Mbps, a late one near 5 Mbps —
+        # NOT the flat ~52.5 Mbps average the uniform fallback would produce.
+        early = rx.get(nf._bucket(self.flow_start + 30), 0.0)
+        late = rx.get(nf._bucket(self.flow_start + 100), 0.0)
+        self.assertGreater(early, 60_000_000)
+        self.assertLess(late, 25_000_000)
+        self.assertEqual(self.c.flows_spread_shaped, 1)
+        self.assertEqual(self.c.flows_spread_uniform, 0)
+
+    def test_uniform_fallback_without_readings(self) -> None:
+        self._poller.live_history.clear()
+        total = 120_000_000
+        self.c._attribute(_lan_record(
+            out_bytes=total, flow_start_ms=1_000_000, flow_end_ms=1_000_000 + 120_000,
+        ))
+        self.c._flush()
+        rx = self._rx_at()
+        bytes_back = sum(v * self.bucket / 8 for v in rx.values())
+        self.assertAlmostEqual(bytes_back, total, delta=total * 0.001)
+        # Flat: every interior bucket carries the same average rate.
+        interior = [v for ts, v in rx.items()
+                    if self.flow_start + self.bucket <= ts <= ARRIVAL_TS - 2 * self.bucket]
+        self.assertTrue(all(abs(v - interior[0]) < 1.0 for v in interior))
+        self.assertEqual(self.c.flows_spread_uniform, 1)
 
 
 class UpsertAddTest(unittest.TestCase):

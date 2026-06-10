@@ -251,6 +251,15 @@ function fillGaps(points) {
   return out;
 }
 
+// Time-axis options per selected range: multi-day windows tick by date
+// (otherwise Chart.js picks hours and a 7-day axis reads "1PM, 6PM, …" with
+// no way to tell the days apart). Tooltips always carry the full date.
+const timeScaleFor = (hours) => ({
+  unit: hours >= 48 ? "day" : undefined,
+  displayFormats: { day: "MMM d" },
+  tooltipFormat: "MMM d, HH:mm",
+});
+
 // Chart.js inline plugin: translucent band over the last LIVE_EDGE_S where
 // flow records may not have arrived yet.
 const liveEdgePlugin = {
@@ -283,7 +292,7 @@ const liveEdgePlugin = {
   },
 };
 
-function chartConfig(label, points) {
+function chartConfig(label, points, hours) {
   points = fillGaps(points);
   const peak = points.reduce((m, p) => Math.max(m, p.tx_bps || 0, p.rx_bps || 0), 0);
   const yUnit = pickAxisUnit(peak);
@@ -312,7 +321,8 @@ function chartConfig(label, points) {
       scales: {
         // Extend the axis to "now" so the chart shows the (shaded) not-yet-
         // reported window instead of ending at the last sample.
-        x: { type: "time", max: Date.now(), time: { tooltipFormat: "MMM d, HH:mm:ss" },
+        x: { type: "time", max: Date.now(),
+             time: { ...timeScaleFor(hours || 1), tooltipFormat: "MMM d, HH:mm:ss" },
              ticks: { color: "#8a96a4" }, grid: { color: "rgba(255,255,255,0.05)" } },
         y: { ticks: { color: "#8a96a4", callback: (v) => fmtRateInUnit(v, yUnit) },
              title: { display: true, text: yUnit.label, color: "#8a96a4" },
@@ -346,7 +356,7 @@ function fillUsageBins(points, bucketS, sinceTs) {
 
 // Volume-per-bin bar chart (modal + home page). Bin width per range keeps the
 // bar count readable; the current (still-filling) bin is drawn faded.
-function usageChartConfig(points, bucketS, sinceTs) {
+function usageChartConfig(points, bucketS, sinceTs, hours) {
   points = fillUsageBins(points, bucketS, sinceTs);
   const nowBinMs = Math.floor(Date.now() / 1000 / bucketS) * bucketS * 1000;
   const fade = (base, faded) => (ctx) => (ctx.raw && ctx.raw.x >= nowBinMs ? faded : base);
@@ -373,8 +383,7 @@ function usageChartConfig(points, bucketS, sinceTs) {
     options: {
       responsive: true, maintainAspectRatio: false, animation: false,
       scales: {
-        x: { type: "time", stacked: true, offset: true,
-             time: { tooltipFormat: "MMM d, HH:mm" },
+        x: { type: "time", stacked: true, offset: true, time: timeScaleFor(hours || 1),
              ticks: { color: "#8a96a4" }, grid: { color: "rgba(255,255,255,0.05)" } },
         y: { stacked: true, beginAtZero: true,
              ticks: { color: "#8a96a4", callback: (v) => fmtBytesInUnit(v, yUnit) },
@@ -403,7 +412,7 @@ async function refreshMainChart() {
   document.getElementById("chart-title").textContent =
     `Network usage — ${fmtBytes(totalBytes)} in last ${hours}h (per ${USAGE_BUCKET_LABEL[hours] || "bin"})`;
   if (mainChart) mainChart.destroy();
-  mainChart = new Chart(ctx, usageChartConfig(data.points, bucketS, data.since));
+  mainChart = new Chart(ctx, usageChartConfig(data.points, bucketS, data.since, hours));
 }
 
 function updateModalHeader(d) {
@@ -429,7 +438,7 @@ async function refreshModalChart() {
   const data = await fetchJSON(`/api/devices/${encodeURIComponent(selectedMac)}/history?hours=${hours}`);
   const ctx = document.getElementById("m-chart").getContext("2d");
   if (modalChart) modalChart.destroy();
-  modalChart = new Chart(ctx, chartConfig(null, data.points));
+  modalChart = new Chart(ctx, chartConfig(null, data.points, hours));
 }
 
 async function refreshModalUsage() {
@@ -442,7 +451,7 @@ async function refreshModalUsage() {
     `— bytes moved per ${USAGE_BUCKET_LABEL[hours] || "bin"}; faded bar = bin still filling`;
   const ctx = document.getElementById("m-usage-chart").getContext("2d");
   if (modalUsageChart) modalUsageChart.destroy();
-  modalUsageChart = new Chart(ctx, usageChartConfig(data.points, bucketS, data.since));
+  modalUsageChart = new Chart(ctx, usageChartConfig(data.points, bucketS, data.since, hours));
 }
 
 async function openDeviceModal(mac) {

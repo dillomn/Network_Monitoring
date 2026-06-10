@@ -114,7 +114,9 @@ def parse_dhcp(text: str) -> list[DhcpLease]:
                 continue  # lease time HH:MM:SS — captured separately
             leftover.append(c)
         hostname = leftover[-1] if leftover else None
-        if hostname and hostname.lower() in {"---", "n/a", "unknown"}:
+        # Placeholder hostnames ("--", "---", …) vary by firmware — treat any
+        # all-dash value as absent so the UI shows "(unknown)" consistently.
+        if hostname and (hostname.lower() in {"n/a", "unknown"} or re.fullmatch(r"-+", hostname)):
             hostname = None
 
         lease_time = None
@@ -153,7 +155,7 @@ def parse_arp(text: str) -> list[ArpEntry]:
         # Drop trailing port/vlan markers like "P1", "---"
         cells = [c for c in cells if not re.fullmatch(r"P\d+|---|\d+", c, re.IGNORECASE)]
         hostname = cells[-1] if cells else None
-        if hostname and hostname in {"---"}:
+        if hostname and re.fullmatch(r"-+", hostname):
             hostname = None
 
         out[mac] = ArpEntry(ip=ip, mac=mac, hostname=hostname, interface=interface)

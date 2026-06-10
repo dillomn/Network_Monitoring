@@ -328,9 +328,26 @@ function chartConfig(label, points) {
   };
 }
 
-// Volume-per-bin bar chart (modal). Bin width per range keeps the bar count
-// readable; the current (still-filling) bin is drawn faded.
-function usageChartConfig(points, bucketS) {
+// Fill the selected window with explicit zero bins. Two reasons: (1) honest
+// gaps — a quiet half hour shows as empty slots, not absent space; (2) bar
+// sizing — Chart.js "flex" thickness sizes bars from the spacing between
+// adjacent points, so with only sparse non-zero bins an isolated bar would
+// stretch to fill the whole gap. Dense bins = every bar exactly one slot wide.
+function fillUsageBins(points, bucketS, sinceTs) {
+  const byTs = new Map(points.map(p => [p.ts, p]));
+  const start = Math.ceil(sinceTs / bucketS) * bucketS;
+  const end = Math.floor(Date.now() / 1000 / bucketS) * bucketS;
+  const out = [];
+  for (let t = start; t <= end; t += bucketS) {
+    out.push(byTs.get(t) || { ts: t, tx_bytes: 0, rx_bytes: 0 });
+  }
+  return out;
+}
+
+// Volume-per-bin bar chart (modal + home page). Bin width per range keeps the
+// bar count readable; the current (still-filling) bin is drawn faded.
+function usageChartConfig(points, bucketS, sinceTs) {
+  points = fillUsageBins(points, bucketS, sinceTs);
   const nowBinMs = Math.floor(Date.now() / 1000 / bucketS) * bucketS * 1000;
   const fade = (base, faded) => (ctx) => (ctx.raw && ctx.raw.x >= nowBinMs ? faded : base);
   const peak = points.reduce((m, p) => Math.max(m, (p.tx_bytes || 0) + (p.rx_bytes || 0)), 0);
@@ -343,11 +360,13 @@ function usageChartConfig(points, bucketS) {
           label: "TX (upload)",
           data: points.map(p => ({ x: p.ts * 1000, y: p.tx_bytes })),
           backgroundColor: fade("rgba(255,180,84,0.8)", "rgba(255,180,84,0.35)"),
+          barThickness: "flex", barPercentage: 1.0, categoryPercentage: 0.92,
         },
         {
           label: "RX (download)",
           data: points.map(p => ({ x: p.ts * 1000, y: p.rx_bytes })),
           backgroundColor: fade("rgba(92,200,255,0.8)", "rgba(92,200,255,0.35)"),
+          barThickness: "flex", barPercentage: 1.0, categoryPercentage: 0.92,
         },
       ],
     },
@@ -384,7 +403,7 @@ async function refreshMainChart() {
   document.getElementById("chart-title").textContent =
     `Network usage — ${fmtBytes(totalBytes)} in last ${hours}h (per ${USAGE_BUCKET_LABEL[hours] || "bin"})`;
   if (mainChart) mainChart.destroy();
-  mainChart = new Chart(ctx, usageChartConfig(data.points, bucketS));
+  mainChart = new Chart(ctx, usageChartConfig(data.points, bucketS, data.since));
 }
 
 function updateModalHeader(d) {
@@ -423,7 +442,7 @@ async function refreshModalUsage() {
     `— bytes moved per ${USAGE_BUCKET_LABEL[hours] || "bin"}; faded bar = bin still filling`;
   const ctx = document.getElementById("m-usage-chart").getContext("2d");
   if (modalUsageChart) modalUsageChart.destroy();
-  modalUsageChart = new Chart(ctx, usageChartConfig(data.points, bucketS));
+  modalUsageChart = new Chart(ctx, usageChartConfig(data.points, bucketS, data.since));
 }
 
 async function openDeviceModal(mac) {

@@ -35,7 +35,9 @@ header h1 { font-size: 16px; margin: 0; letter-spacing: 0.02em; }
 
 main {
   display: grid;
-  grid-template-columns: minmax(420px, 1fr) 2fr;
+  /* Devices panel gets more room than the chart — the table has 7 columns
+     and the rate cells need space for the live dot + value. */
+  grid-template-columns: minmax(520px, 1fr) 1.6fr;
   grid-template-rows: auto minmax(0, 1fr);
   gap: 12px;
   padding: 12px;
@@ -63,10 +65,10 @@ main {
 }
 
 table { width: 100%; border-collapse: collapse; table-layout: fixed; }
-.col-device { width: 20%; }
+.col-device { width: 18%; }
 .col-ip { width: 13%; }
-.col-mac { width: 17%; }
-.col-rate { width: 13%; }
+.col-mac { width: 16%; }
+.col-rate { width: 14.5%; }
 .col-vol { width: 12%; }
 thead th {
   position: sticky; top: 0; background: var(--panel-2); text-align: left;

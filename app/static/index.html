@@ -18,6 +18,29 @@
   </header>
 
   <main>
+    <section class="tiles">
+      <div class="tile">
+        <span class="t-label">Network now</span>
+        <span class="t-value" id="t-now">—</span>
+        <span class="t-sub">sum of device rates (live)</span>
+      </div>
+      <div class="tile">
+        <span class="t-label">Volume — 24h</span>
+        <span class="t-value" id="t-vol24">—</span>
+        <span class="t-sub">all devices</span>
+      </div>
+      <div class="tile">
+        <span class="t-label">Devices online</span>
+        <span class="t-value" id="t-online">—</span>
+        <span class="t-sub">seen in last 5 min</span>
+      </div>
+      <div class="tile">
+        <span class="t-label">Top consumer — 24h</span>
+        <span class="t-value" id="t-top">—</span>
+        <span class="t-sub" id="t-top-sub">&nbsp;</span>
+      </div>
+    </section>
+
     <section class="panel devices">
       <div class="panel-head">
         <h2>Devices</h2>
@@ -50,7 +73,7 @@
 
     <section class="panel chart-panel">
       <div class="panel-head">
-        <h2 id="chart-title">Top talkers — last hour</h2>
+        <h2 id="chart-title">Network usage</h2>
         <select id="range">
           <option value="1">1 hour</option>
           <option value="6">6 hours</option>
@@ -98,9 +121,9 @@
         </label>
       </div>
       <div class="modal-body">
-        <h3 class="chart-sub">Volume <span class="parens" id="m-usage-note">— exact bytes moved per bin</span></h3>
+        <h3 class="chart-sub">Volume <span class="parens" id="m-usage-note">— bytes moved per bin</span></h3>
         <div class="chart-wrap usage"><canvas id="m-usage-chart"></canvas></div>
-        <h3 class="chart-sub">Rate <span class="parens">— shape inside a long transfer is an average, not measured</span></h3>
+        <h3 class="chart-sub">Rate <span class="parens">— live readings fill in as they happen; NetFlow's exact figures replace them at flow end</span></h3>
         <div class="chart-wrap big"><canvas id="m-chart"></canvas></div>
       </div>
     </div>

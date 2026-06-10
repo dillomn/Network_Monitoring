@@ -116,10 +116,12 @@ async def _tcp_reachable(host: str, port: int, timeout: float = 4.0) -> tuple[bo
 
 @app.get("/api/diagnostics")
 async def diagnostics() -> dict:
-    """Structured health checks for the settings/troubleshooting panel —
-    router reachability, SSH auth, NetFlow ingest + attribution, DB, and a
-    config summary. Each row is {id,label,status,detail[,hint]}; status is
-    ok | warn | fail | info. The frontend renders these as colored rows."""
+    """Health + data-quality checks for the settings panel, focused on the
+    questions that actually come up in operation: is the router link up, is
+    NetFlow arriving, WHERE are the bytes being credited (the accuracy lens —
+    this is the row that explains a download that never showed up), and is
+    the live rate poller covering active devices. Each row is
+    {id,label,status,detail[,hint]}; status is ok | warn | fail | info."""
     now = int(time.time())
     nf = netflow.stats()
     checks: list[dict] = []
@@ -128,99 +130,65 @@ async def diagnostics() -> dict:
         "config", "Configuration", "info",
         f"router {settings.router_host}:{settings.router_ssh_port} as "
         f"{settings.router_ssh_user} • NetFlow udp/{settings.netflow_port} • "
-        f"poll {settings.poll_interval}s • retention {settings.retention_days}d",
+        f"poll {settings.poll_interval}s • retention {settings.retention_days}d • "
+        f"LAN prefixes: {settings.lan_prefixes}",
     ))
 
-    # Router SSH port reachable (active TCP connect).
-    reachable, err = await _tcp_reachable(settings.router_host, settings.router_ssh_port)
-    checks.append(_check(
-        "ssh_tcp", "Router SSH port reachable", "ok" if reachable else "fail",
-        f"TCP {settings.router_host}:{settings.router_ssh_port} "
-        + ("open" if reachable else f"unreachable — {err}"),
-        None if reachable else
-        "Confirm the router is on the LAN and SSH is enabled "
-        "(System Maintenance → Management → SSH).",
-    ))
-
-    # SSH credentials / session — read from the background poller's live state
-    # (it reconnects every poll, so this is effectively current) to avoid
-    # contending for the single SSH session.
-    if poller.router_model:
-        detail = (f"authenticated to {poller.router_model} (firmware "
-                  f"{poller.router_firmware})")
-        if poller.last_poll_ts:
-            detail += f"; last poll {now - poller.last_poll_ts}s ago"
-        if not poller.last_poll_ok and poller.last_error:
-            detail += f"; last error: {poller.last_error}"
-        checks.append(_check("ssh_auth", "SSH credentials / session",
-                             "ok" if poller.last_poll_ok else "warn", detail))
-    else:
+    # --- Router link: SSH session + poll loop in one row. Only runs the TCP
+    # probe when polling is unhealthy, to tell "router down" from "bad creds".
+    poll_age = (now - poller.last_poll_ts) if poller.last_poll_ts else None
+    poll_fresh = poll_age is not None and poll_age <= max(10, settings.poll_interval * 5)
+    if poller.last_poll_ok and poll_fresh and poller.router_model:
         checks.append(_check(
-            "ssh_auth", "SSH credentials / session",
-            "fail" if poller.last_error else "warn",
-            poller.last_error or "no successful SSH poll yet — waiting for first connect",
-            "If authentication fails, check ROUTER_SSH_USER / ROUTER_SSH_PASSWORD in "
-            ".env. For 'no matching cipher', widen LEGACY_SSH_KWARGS in "
-            "app/collectors/ssh.py.",
-        ))
-
-    # Background poll loop health.
-    if poller.last_poll_ts:
-        age = now - poller.last_poll_ts
-        stale = age > max(10, settings.poll_interval * 5)
-        checks.append(_check(
-            "poll", "Background poll loop", "ok" if (poller.last_poll_ok and not stale) else "warn",
-            f"last poll {age}s ago, {'ok' if poller.last_poll_ok else 'failed'}, "
-            f"{poller.last_device_count} devices discovered"
-            + (f"; {poller.last_error}" if poller.last_error else ""),
+            "router", "Router link", "ok",
+            f"{poller.router_model} (fw {poller.router_firmware}) — last poll "
+            f"{poll_age}s ago, {poller.last_device_count} devices discovered",
         ))
     else:
-        checks.append(_check("poll", "Background poll loop", "warn", "no poll completed yet"))
+        reachable, err = await _tcp_reachable(settings.router_host, settings.router_ssh_port)
+        if not reachable:
+            checks.append(_check(
+                "router", "Router link", "fail",
+                f"TCP {settings.router_host}:{settings.router_ssh_port} unreachable — {err}",
+                "Confirm the router is on the LAN and SSH is enabled "
+                "(System Maintenance → Management → SSH).",
+            ))
+        else:
+            checks.append(_check(
+                "router", "Router link", "warn" if poller.router_model else "fail",
+                poller.last_error or "port open but no successful SSH poll yet",
+                "Check ROUTER_SSH_USER / ROUTER_SSH_PASSWORD in .env. For "
+                "'no matching cipher', widen LEGACY_SSH_KWARGS in app/collectors/ssh.py.",
+            ))
 
-    # NetFlow listener bound.
-    checks.append(_check(
-        "nf_listen", "NetFlow listener", "ok" if nf["listening_port"] else "fail",
-        f"listening on udp/{nf['listening_port']}" if nf["listening_port"]
-        else "not bound — check NETFLOW_PORT and that nothing else owns the port",
-    ))
-
-    # NetFlow packets received.
+    # --- NetFlow ingest: listener + packet flow in one row.
     age = nf["last_packet_age_s"]
-    if nf["packets_received"] == 0:
+    if not nf["listening_port"]:
         checks.append(_check(
-            "nf_packets", "NetFlow packets received", "warn",
-            "0 packets received — nothing is exporting here yet",
-            "Real router: System Maintenance → NetFlow → Collector IP = this host, "
+            "nf", "NetFlow ingest", "fail",
+            "listener not bound — check NETFLOW_PORT and that nothing else owns the port",
+        ))
+    elif nf["packets_received"] == 0:
+        checks.append(_check(
+            "nf", "NetFlow ingest", "warn",
+            f"listening on udp/{nf['listening_port']} but 0 packets received",
+            "Router: System Maintenance → NetFlow → Collector IP = this host, "
             f"Port {settings.netflow_port}, v9. Test rig: run tools/netflow_sim.py.",
         ))
     else:
         fresh = age is not None and age < 30
         checks.append(_check(
-            "nf_packets", "NetFlow packets received", "ok" if fresh else "warn",
-            f"{nf['packets_received']} packets, {nf['records_parsed']} records parsed; "
-            f"last packet {age}s ago" + ("" if fresh else " (stale)")
+            "nf", "NetFlow ingest", "ok" if fresh else "warn",
+            f"{nf['packets_received']} packets / {nf['records_parsed']} records, "
+            f"{len(nf['templates_known'])} templates; last packet {age}s ago"
+            + ("" if fresh else " (stale)")
             + (f"; from {nf['last_router_addr']}" if nf["last_router_addr"] else ""),
         ))
 
-    # NetFlow attribution — records credited to a known device.
-    parsed, processed = nf["records_parsed"], nf["records_processed"]
-    if parsed == 0:
-        checks.append(_check("nf_attrib", "NetFlow attribution", "info", "no records yet"))
-    elif processed == 0:
-        checks.append(_check(
-            "nf_attrib", "NetFlow attribution", "warn",
-            f"{parsed} records parsed but 0 credited to a device",
-            "Records arrive but no LAN device owns the IP — SSH discovery may not have "
-            "mapped MACs yet, or inbound records need the NAT port-map.",
-        ))
-    else:
-        checks.append(_check(
-            "nf_attrib", "NetFlow attribution", "ok",
-            f"{processed}/{parsed} records credited; {nf['tracked_devices']} devices "
-            f"with samples pending flush, {nf['records_errored']} errored",
-        ))
-
-    # NetFlow byte attribution — the accuracy lens (ties to the HW-accel caveat).
+    # --- Byte attribution: where the traffic volume is actually landing.
+    # This is the row to read when a known download didn't show up: the bytes
+    # went SOMEWHERE — outbound/inbound means credited, the other reasons say
+    # exactly which guard dropped them.
     reason_bytes = nf.get("reason_bytes", {})
     if reason_bytes:
         credited = reason_bytes.get("outbound", 0) + reason_bytes.get("inbound", 0)
@@ -228,22 +196,55 @@ async def diagnostics() -> dict:
         pct = 100 * credited / total
         top = " • ".join(f"{k} {_human_bytes(v)}"
                          for k, v in sorted(reason_bytes.items(), key=lambda kv: -kv[1])[:4])
+        hints = []
+        if reason_bytes.get("both_public", 0) / total > 0.10:
+            hints.append(
+                "large 'both_public' share usually means IPv6: a device downloading over a "
+                "global v6 address isn't matched by the default LAN_PREFIXES — check "
+                "/api/netflow/recent for v6 src/dst during a test download and add your "
+                "delegated prefix (e.g. 2a02:xxxx::/64) to LAN_PREFIXES in .env"
+            )
+        if reason_bytes.get("no_mac", 0) / total > 0.10:
+            hints.append(
+                "'no_mac' bytes are flows for IPs discovery hasn't mapped — often inbound "
+                "NAT records whose port-map entry was already gone, or v6 addresses with "
+                "no MAC in the record"
+            )
         checks.append(_check(
-            "nf_bytes", "NetFlow byte attribution", "ok" if pct >= 80 else "warn",
+            "nf_bytes", "Byte attribution", "ok" if pct >= 80 else "warn",
             f"{pct:.0f}% of bytes credited to devices • {top}",
-            None if pct >= 80 else
-            "Most bytes are landing on no_mac/both_*. If a real download barely moves "
-            "these, Hardware Acceleration may be bypassing the exporter (see the "
-            "accuracy caveat in the README).",
+            "; ".join(hints) if hints else None,
+        ))
+    else:
+        checks.append(_check("nf_bytes", "Byte attribution", "info",
+                             "no byte-carrying flow records yet"))
+
+    # --- Live rate poller (Data Flow Monitor over SSH) — the source that
+    # makes in-progress transfers visible before their flow record exports.
+    dfm = poller.dfm_stats()
+    if dfm["last_reading_ts"]:
+        dfm_age = now - dfm["last_reading_ts"]
+        checks.append(_check(
+            "dfm", "Live rate poller", "ok" if dfm_age < 60 else "warn",
+            f"{dfm['tracked']} devices with live readings, last reading {dfm_age}s ago "
+            f"(rotates through devices with open NAT sessions)",
+            None if dfm_age < 60 else
+            "No recent readings — the SSH poll loop may be failing (see Router link).",
+        ))
+    else:
+        checks.append(_check(
+            "dfm", "Live rate poller", "info",
+            "no live readings yet — starts as soon as a device has open NAT sessions",
         ))
 
-    # Database.
+    # --- Database.
     try:
         counts = db.table_counts()
         checks.append(_check(
             "db", "Database", "ok",
-            f"{counts['devices']} devices, {counts['samples']} samples, "
-            f"{counts['wan_samples']} WAN samples at {settings.db_path}",
+            f"{counts['devices']} devices, {counts['samples']} flow samples, "
+            f"{counts['live_samples']} live samples, {counts['wan_samples']} WAN samples "
+            f"at {settings.db_path}",
         ))
     except Exception as e:
         checks.append(_check("db", "Database", "fail", f"{type(e).__name__}: {e}"))
@@ -308,17 +309,24 @@ async def devices() -> list[dict]:
     for r in rows:
         if not r.get("vendor"):
             r["vendor"] = oui.lookup(r["mac"])
-        # rate_pending: open NAT sessions but no fresh sample bucket. The
-        # router exports a long flow only when it ends, so this device may be
-        # mid-transfer and unmeasured — the UI shows "pending" instead of a
-        # false 0 bps. Limits: NAT entries linger after close (false
-        # positive), and a long flow plus background chatter keeps buckets
-        # fresh, hiding the badge (false negative). Honest hint, not a meter.
         n = sessions.get(r.get("ip") or "", 0)
-        ls = r.get("last_sample")
-        fresh = ls is not None and now - ls <= db.CURRENT_STALE_S
         r["active_sessions"] = n
-        r["rate_pending"] = n > 0 and not fresh
+        # "Now" rate, best source first:
+        #   live — a fresh Data Flow Monitor reading from the router. Works
+        #          mid-transfer, which NetFlow can't (flows export at end).
+        #   flow — latest NetFlow sample bucket is fresh.
+        #   idle — neither; with open NAT sessions the UI shows "pending"
+        #          (something may be moving that nothing has measured yet).
+        live = poller.live_rates.get(r["mac"])
+        ls = r.get("last_sample")
+        if live is not None and now - live[2] <= db.CURRENT_STALE_S:
+            r["tx_bps"], r["rx_bps"] = live[0], live[1]
+            r["rate_source"] = "live"
+        elif ls is not None and now - ls <= db.CURRENT_STALE_S:
+            r["rate_source"] = "flow"
+        else:
+            r["rate_source"] = "idle"
+        r["rate_pending"] = n > 0 and r["rate_source"] == "idle"
     return rows
 
 
@@ -342,6 +350,17 @@ async def usage(
     since = int(time.time()) - hours * 3600
     points = db.usage_for(mac.upper(), since, bucket_s)
     return {"mac": mac.upper(), "since": since, "bucket_s": bucket_s, "points": points}
+
+
+@app.get("/api/usage/total")
+async def usage_total_api(
+    hours: int = Query(24, ge=1, le=24 * 30),
+    bucket_s: int = Query(3600, ge=60, le=86400),
+) -> dict:
+    """Network-wide volume per time bin, all devices summed — the home page
+    chart. Same merged series as the per-device view."""
+    since = int(time.time()) - hours * 3600
+    return {"since": since, "bucket_s": bucket_s, "points": db.usage_total(since, bucket_s)}
 
 
 class NoteIn(BaseModel):

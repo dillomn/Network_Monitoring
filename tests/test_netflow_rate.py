@@ -222,5 +222,66 @@ class VolumeTest(unittest.TestCase):
         self.assertEqual(d["vol_rx_24h"], 0.0)
 
 
+class LiveMergeTest(unittest.TestCase):
+    """live_samples (Data Flow Monitor readings) merge with NetFlow samples by
+    per-bucket MAX: live estimates fill buckets NetFlow hasn't reported yet (a
+    transfer in progress, or a flow the exporter never sent), and NetFlow's
+    larger exact figures win once the flow-end record backfills."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self._real_path = db.settings.db_path
+        db.settings.db_path = self.tmp.name
+        db.init_db()
+
+    def tearDown(self) -> None:
+        db.settings.db_path = self._real_path
+        os.unlink(self.tmp.name)
+
+    def test_live_fills_gaps_and_larger_netflow_wins(self) -> None:
+        db.add_samples([("AA", 1000, 100.0, 1000.0)])   # NetFlow bucket
+        db.upsert_live_sample("AA", 1000, 40.0, 400.0)  # overlapped → NetFlow wins (MAX)
+        db.upsert_live_sample("AA", 1010, 40.0, 400.0)  # live-only bucket survives
+        pts = {p["ts"]: (p["tx_bps"], p["rx_bps"]) for p in db.history_for("AA", 0)}
+        self.assertEqual(pts[1000], (100.0, 1000.0))
+        self.assertEqual(pts[1010], (40.0, 400.0))
+
+    def test_live_estimate_beats_smaller_netflow_chatter(self) -> None:
+        # Mid-download: NetFlow only has the device's background chatter for
+        # this bucket; the DFM reading carries the real rate. MAX keeps it.
+        db.add_samples([("AA", 1000, 0.0, 5000.0)])           # 5 Kbps chatter
+        db.upsert_live_sample("AA", 1000, 0.0, 35_000_000.0)  # 35 Mbps download
+        pts = db.history_for("AA", 0)
+        self.assertEqual(pts[0]["rx_bps"], 35_000_000.0)
+
+    def test_live_reading_replaced_within_bucket(self) -> None:
+        db.upsert_live_sample("AA", 1000, 10.0, 10.0)
+        db.upsert_live_sample("AA", 1000, 70.0, 80.0)  # newer reading supersedes
+        pts = db.history_for("AA", 0)
+        self.assertEqual(len(pts), 1)
+        self.assertEqual((pts[0]["tx_bps"], pts[0]["rx_bps"]), (70.0, 80.0))
+
+    def test_usage_total_sums_devices_and_sources(self) -> None:
+        b = db.SAMPLE_BUCKET_S
+        db.add_samples([("AA", 3600, 80.0, 0.0)])
+        db.add_samples([("BB", 3600 + b, 80.0, 0.0)])
+        db.upsert_live_sample("CC", 3600, 80.0, 0.0)
+        pts = db.usage_total(0, 3600)
+        self.assertEqual(len(pts), 1)
+        self.assertEqual(pts[0]["ts"], 3600)
+        self.assertAlmostEqual(pts[0]["tx_bytes"], 3 * 80.0 * b / 8)
+
+    def test_volumes_include_live_only_buckets(self) -> None:
+        b = db.SAMPLE_BUCKET_S
+        db.upsert_device("AA", "192.168.1.10", "thing")
+        now = int(time.time())
+        bucket = now - (now % b) - 60
+        db.upsert_live_sample("AA", bucket, 0.0, 8.0)  # live-only: b bytes RX
+        d = {r["mac"]: r for r in db.list_devices_with_current()}["AA"]
+        self.assertAlmostEqual(d["vol_rx_1h"], 8.0 * b / 8)
+        self.assertAlmostEqual(d["vol_rx_24h"], 8.0 * b / 8)
+
+
 if __name__ == "__main__":
     unittest.main()

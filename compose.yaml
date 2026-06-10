@@ -14,14 +14,15 @@ services:
     env_file: .env
     environment:
       - DB_PATH=/data/netmon.db
-      # Debug-only now: scales the legacy `show traffic <ip>` series used by
-      # /debug/ssh/raw-traffic to cross-check NetFlow against the router's
-      # Data Flow Monitor page. Not on the live data path. kilobits/sec is
-      # the Vigor 2765 unit (raw 88064 → 88 Mbps); recalibrate per model.
+      # LIVE PATH: scales the `show traffic <ip>` Data Flow Monitor series,
+      # which is the live per-device rate source (NetFlow reports a flow only
+      # when it ends). A wrong unit scales every live rate. kilobits/sec is
+      # the Vigor 2765 unit (raw 88064 → 88 Mbps); recalibrate per model via
+      # /debug/ssh/raw-traffic?ip=<ip>.
       - TRAFFIC_UNIT=kilobits_per_second
-      # Seconds the SSH poll loop sleeps between cycles. The loop only does
-      # discovery (DHCP+ARP), WAN totals, and the NAT port-map now — NetFlow
-      # owns per-device traffic — so 1s is cheap on the router.
+      # Seconds the SSH poll loop sleeps between cycles. Each cycle does
+      # discovery (DHCP+ARP), WAN totals, the NAT port-map (every 5th), and
+      # ONE Data Flow Monitor reading (round-robin over active devices).
       - POLL_INTERVAL=1
     volumes:
       - draymon_data:/data

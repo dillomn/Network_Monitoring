@@ -36,10 +36,21 @@ header h1 { font-size: 16px; margin: 0; letter-spacing: 0.02em; }
 main {
   display: grid;
   grid-template-columns: minmax(420px, 1fr) 2fr;
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 12px;
   padding: 12px;
   height: calc(100vh - 50px);
 }
+
+.tiles { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.tile {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 16px; display: flex; flex-direction: column; gap: 2px; min-width: 0;
+}
+.t-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+.t-value { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.t-sub { font-size: 10px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
   display: flex; flex-direction: column; overflow: hidden; }
 .panel-head { display: flex; align-items: center; justify-content: space-between;
@@ -107,6 +118,11 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .pending {
   color: var(--warn); font-size: 11px; font-weight: 600;
   letter-spacing: 0.04em; cursor: help;
+}
+/* Rate comes from a fresh Data Flow Monitor reading (live), not NetFlow. */
+.dot-live {
+  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--good); margin-right: 6px; vertical-align: middle;
 }
 
 .chart-wrap { flex: 1; padding: 12px; min-height: 0; position: relative; }

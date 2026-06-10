@@ -20,17 +20,29 @@ Built and tested against the **Vigor 2762n** and **Vigor 2765 series**.
 The router exports a flow's **total bytes + start/end time only when the flow ends** (its
 Active Timeout doesn't chop ongoing flows — see DrayTek setup below). Consequences:
 
-- **Volumes (1h/24h columns, the per-bin bar chart) are exact** — they sum to what the flow
-  records reported.
-- **Rate lines are estimates**: bytes are spread uniformly across each flow's span, so a long
-  download that ran fast-then-slow draws as a flat average. Short flows (most traffic, expired
-  ≤15 s after going idle) are nearly true-to-shape.
-- **Nothing about a long transfer is visible until it finishes** — it then backfills the charts
-  at the right place and rate. The "in progress…" badge (open NAT sessions, no fresh samples)
-  is the live hint that a device is doing something unmeasured.
+- **Volumes (1h/24h columns, the bar charts) are exact where NetFlow reported** and
+  live-estimated where only Data Flow Monitor readings exist (a transfer still in
+  progress, or a flow the exporter never sent).
+- **Rate lines are estimates**: NetFlow bytes are spread uniformly across each flow's span,
+  so a long download that ran fast-then-slow draws as a flat average. Short flows (most
+  traffic, expired ≤15 s after going idle) are nearly true-to-shape.
+- **Long transfers are visible live** via the Data Flow Monitor readings (green dot next to
+  the rate = live reading); when the flow record finally exports, its exact figures replace
+  the estimates. A wrong `TRAFFIC_UNIT` scales every live reading — calibrate via
+  `/debug/ssh/raw-traffic?ip=<ip>`.
+- **If a known download never showed up at all**, open Settings → *Byte attribution*: the
+  bytes landed somewhere, and that row says which guard dropped them (a large `both_public`
+  share usually means IPv6 — add your delegated prefix to `LAN_PREFIXES`).
 - **Settings ⚙** (header gear) opens a troubleshooting panel that runs live checks — router reachable, SSH auth, NetFlow ingest/attribution, DB — backed by `/api/diagnostics`
 
-> **Data sources at a glance:** per-device traffic comes **only** from NetFlow. SSH supplies device identity (DHCP/ARP), WAN totals (`show statistic`), and the NAT port-map — it does **not** measure per-device traffic. The `show traffic <ip>` CLI path survives solely in the `/debug/ssh/*` endpoints for cross-checking.
+> **Data sources at a glance:** two complementary per-device sources. **NetFlow** is the
+> accounting source — exact byte counts, but a flow is only reported when it *ends*.
+> The **Data Flow Monitor** (`show traffic <ip>` over SSH, polled round-robin one device
+> per second across devices with open NAT sessions) is the live source — it sees a
+> transfer *while it runs*, including flows NetFlow never reports. Charts merge them
+> per 10 s bucket by MAX, so live estimates fill the gaps and NetFlow's exact figures
+> win once they arrive. SSH also supplies device identity (DHCP/ARP), WAN totals, and
+> the NAT port-map.
 
 ## Prerequisites
 
@@ -84,6 +96,8 @@ docker compose exec draymon python tools/netflow_sim.py --db /data/netmon.db
 ```
 
 The device list and graphs fill in within a few seconds. Drop `--db` to send NetFlow only (stats light up, device list stays empty). This exercises the software path but **cannot** test the hardware-acceleration accuracy question — that needs real traffic across the router's WAN.
+
+**IPv6 attribution test (no router needed):** add `--ipv6 2001:db8:abcd::/64` to also emit IPv6 flows. With that prefix *absent* from `LAN_PREFIXES`, the bytes must pile up under `both_public` in *Settings → Byte attribution* — the exact signature of a v6 download that never shows in the UI. Add the prefix to `LAN_PREFIXES`, restart, re-run: the same flows must now credit to the devices (attribution uses the src MAC in the record, since v6 addresses aren't in the devices table). Repeat with your *real* delegated prefix to validate production config.
 
 ## .env reference
 

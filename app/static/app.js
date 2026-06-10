@@ -106,9 +106,31 @@ async function refreshHealth() {
 async function refreshDevices() {
   devices = await fetchJSON("/api/devices");
   renderDeviceTable();
+  refreshTiles();
   if (selectedMac) {
     const d = devices.find(x => x.mac === selectedMac);
     if (d) updateModalHeader(d);
+  }
+}
+
+function refreshTiles() {
+  const nowS = Date.now() / 1000;
+  const sumTx = devices.reduce((s, d) => s + (d.tx_bps || 0), 0);
+  const sumRx = devices.reduce((s, d) => s + (d.rx_bps || 0), 0);
+  const online = devices.filter(d => d.last_seen && nowS - d.last_seen < 300).length;
+  const top = devices.slice().sort((a, b) => vol24h(b) - vol24h(a))[0];
+  document.getElementById("t-now").textContent = `↓ ${fmtRate(sumRx)}   ↑ ${fmtRate(sumTx)}`;
+  document.getElementById("t-vol24").textContent =
+    fmtBytes(devices.reduce((s, d) => s + vol24h(d), 0));
+  document.getElementById("t-online").textContent = `${online} / ${devices.length}`;
+  const tt = document.getElementById("t-top");
+  const ts = document.getElementById("t-top-sub");
+  if (top && vol24h(top) > 0) {
+    tt.textContent = top.hostname || top.ip || top.mac;
+    ts.textContent = `${fmtBytes(vol24h(top))} (↓ ${fmtBytes(top.vol_rx_24h)} ↑ ${fmtBytes(top.vol_tx_24h)})`;
+  } else {
+    tt.textContent = "—";
+    ts.innerHTML = "&nbsp;";
   }
 }
 
@@ -168,9 +190,11 @@ function renderDeviceTable() {
       // Open NAT sessions but no fresh flow data: the router only exports a
       // long transfer when it finishes, so the rate is unknown — say so
       // instead of showing a false 0 bps.
+      const liveDot = d.rate_source === "live"
+        ? `<span class="dot-live" title="live reading from the router's Data Flow Monitor"></span>` : "";
       const rateCells = d.rate_pending
         ? `<td class="num" colspan="2"><span class="pending" title="${d.active_sessions} open NAT session(s) but no flow data — the router reports a long transfer only when it finishes">in progress…</span></td>`
-        : `<td class="num"><span class="rate">${fmtRate(d.tx_bps)}</span></td>
+        : `<td class="num">${liveDot}<span class="rate">${fmtRate(d.tx_bps)}</span></td>
            <td class="num"><span class="rate">${fmtRate(d.rx_bps)}</span></td>`;
       const barW = Math.round((vol24h(d) / maxVol) * 100);
       return `<tr data-mac="${escapeHtml(d.mac)}" class="${d.mac === selectedMac ? "active" : ""}">
@@ -351,23 +375,16 @@ function usageChartConfig(points, bucketS) {
 
 async function refreshMainChart() {
   const hours = parseInt(document.getElementById("range").value, 10);
-  // Pick the device that moved the most bytes in 24h — volume is the exact
-  // measurement. Picking by current rate made the chart go blank whenever
-  // rates were stale, and missed devices mid-long-flow (rate reads 0).
-  const dev = devices.slice().sort((a, b) => vol24h(b) - vol24h(a))[0];
-
+  // Network-wide volume per bin: exact where NetFlow reported, live-estimated
+  // where only DFM readings exist. Per-device rate lines live in the modal.
+  const bucketS = USAGE_BUCKET_S[hours] || 3600;
+  const data = await fetchJSON(`/api/usage/total?hours=${hours}&bucket_s=${bucketS}`);
   const ctx = document.getElementById("main-chart").getContext("2d");
-  if (!dev || vol24h(dev) <= 0) {
-    document.getElementById("chart-title").textContent = `Top consumer — last ${hours}h (waiting for data)`;
-    if (mainChart) mainChart.destroy();
-    mainChart = null;
-    return;
-  }
-  const data = await fetchJSON(`/api/devices/${encodeURIComponent(dev.mac)}/history?hours=${hours}`);
+  const totalBytes = data.points.reduce((s, p) => s + (p.tx_bytes || 0) + (p.rx_bytes || 0), 0);
   document.getElementById("chart-title").textContent =
-    `Top consumer — ${dev.hostname || dev.mac} (${fmtBytes(vol24h(dev))} in 24h, last ${hours}h)`;
+    `Network usage — ${fmtBytes(totalBytes)} in last ${hours}h (per ${USAGE_BUCKET_LABEL[hours] || "bin"})`;
   if (mainChart) mainChart.destroy();
-  mainChart = new Chart(ctx, chartConfig(null, data.points));
+  mainChart = new Chart(ctx, usageChartConfig(data.points, bucketS));
 }
 
 function updateModalHeader(d) {
@@ -403,7 +420,7 @@ async function refreshModalUsage() {
   const data = await fetchJSON(
     `/api/devices/${encodeURIComponent(selectedMac)}/usage?hours=${hours}&bucket_s=${bucketS}`);
   document.getElementById("m-usage-note").textContent =
-    `— exact bytes moved per ${USAGE_BUCKET_LABEL[hours] || "bin"}; faded bar = bin still filling`;
+    `— bytes moved per ${USAGE_BUCKET_LABEL[hours] || "bin"}; faded bar = bin still filling`;
   const ctx = document.getElementById("m-usage-chart").getContext("2d");
   if (modalUsageChart) modalUsageChart.destroy();
   modalUsageChart = new Chart(ctx, usageChartConfig(data.points, bucketS));

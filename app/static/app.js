@@ -260,6 +260,12 @@ const timeScaleFor = (hours) => ({
   tooltipFormat: "MMM d, HH:mm",
 });
 
+// Fixed width for the Y-axis gutter on the stacked modal charts. Without
+// this, "6.00 GB" vs "120 Mbps" label widths differ, the plot areas start at
+// different x pixels, and the two time axes don't line up vertically.
+const Y_AXIS_WIDTH = 68;
+const yAxisFit = (scale) => { scale.width = Y_AXIS_WIDTH; };
+
 // Chart.js inline plugin: translucent band over the last LIVE_EDGE_S where
 // flow records may not have arrived yet.
 const liveEdgePlugin = {
@@ -319,13 +325,14 @@ function chartConfig(label, points, hours) {
     options: {
       responsive: true, maintainAspectRatio: false, animation: false,
       scales: {
-        // Extend the axis to "now" so the chart shows the (shaded) not-yet-
-        // reported window instead of ending at the last sample.
-        x: { type: "time", max: Date.now(),
+        // Pin the axis to the full selected window (matching the volume bars
+        // above it) and to "now" so the shaded not-yet-reported edge shows.
+        x: { type: "time",
+             min: Date.now() - (hours || 1) * 3600e3, max: Date.now(),
              time: { ...timeScaleFor(hours || 1), tooltipFormat: "MMM d, HH:mm:ss" },
              ticks: { color: "#8a96a4" }, grid: { color: "rgba(255,255,255,0.05)" } },
-        y: { ticks: { color: "#8a96a4", callback: (v) => fmtRateInUnit(v, yUnit) },
-             title: { display: true, text: yUnit.label, color: "#8a96a4" },
+        y: { afterFit: yAxisFit,
+             ticks: { color: "#8a96a4", callback: (v) => fmtRateInUnit(v, yUnit) },
              grid: { color: "rgba(255,255,255,0.05)" }, beginAtZero: true },
       },
       plugins: {
@@ -356,25 +363,40 @@ function fillUsageBins(points, bucketS, sinceTs) {
 
 // Volume-per-bin bar chart (modal + home page). Bin width per range keeps the
 // bar count readable; the current (still-filling) bin is drawn faded.
+//
+// Bars are positioned at the bin MIDPOINT so each one spans exactly the
+// interval it represents (a 7–8 AM bin covers 7:00–8:00, not 6:30–7:30), and
+// the axis is pinned to the same [since, now] window the rate chart uses —
+// the two charts in the modal must line up when read side by side.
 function usageChartConfig(points, bucketS, sinceTs, hours) {
   points = fillUsageBins(points, bucketS, sinceTs);
-  const nowBinMs = Math.floor(Date.now() / 1000 / bucketS) * bucketS * 1000;
-  const fade = (base, faded) => (ctx) => (ctx.raw && ctx.raw.x >= nowBinMs ? faded : base);
+  const halfBinMs = bucketS * 500;
+  const nowBinCenterMs =
+    Math.floor(Date.now() / 1000 / bucketS) * bucketS * 1000 + halfBinMs;
+  const fade = (base, faded) => (ctx) => (ctx.raw && ctx.raw.x >= nowBinCenterMs ? faded : base);
   const peak = points.reduce((m, p) => Math.max(m, (p.tx_bytes || 0) + (p.rx_bytes || 0)), 0);
   const yUnit = pickByteUnit(peak);
+  const binRange = (centerMs) => {
+    const s = new Date(centerMs - halfBinMs);
+    const e = new Date(centerMs + halfBinMs);
+    const sFmt = s.toLocaleString(undefined,
+      { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    const eFmt = e.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+    return `${sFmt} – ${eFmt}`;
+  };
   return {
     type: "bar",
     data: {
       datasets: [
         {
           label: "TX (upload)",
-          data: points.map(p => ({ x: p.ts * 1000, y: p.tx_bytes })),
+          data: points.map(p => ({ x: p.ts * 1000 + halfBinMs, y: p.tx_bytes })),
           backgroundColor: fade("rgba(255,180,84,0.8)", "rgba(255,180,84,0.35)"),
           barThickness: "flex", barPercentage: 1.0, categoryPercentage: 0.92,
         },
         {
           label: "RX (download)",
-          data: points.map(p => ({ x: p.ts * 1000, y: p.rx_bytes })),
+          data: points.map(p => ({ x: p.ts * 1000 + halfBinMs, y: p.rx_bytes })),
           backgroundColor: fade("rgba(92,200,255,0.8)", "rgba(92,200,255,0.35)"),
           barThickness: "flex", barPercentage: 1.0, categoryPercentage: 0.92,
         },
@@ -383,18 +405,20 @@ function usageChartConfig(points, bucketS, sinceTs, hours) {
     options: {
       responsive: true, maintainAspectRatio: false, animation: false,
       scales: {
-        x: { type: "time", stacked: true, offset: true, time: timeScaleFor(hours || 1),
+        x: { type: "time", stacked: true,
+             min: sinceTs * 1000, max: Date.now(),
+             time: timeScaleFor(hours || 1),
              ticks: { color: "#8a96a4" }, grid: { color: "rgba(255,255,255,0.05)" } },
-        y: { stacked: true, beginAtZero: true,
+        y: { stacked: true, beginAtZero: true, afterFit: yAxisFit,
              ticks: { color: "#8a96a4", callback: (v) => fmtBytesInUnit(v, yUnit) },
-             title: { display: true, text: yUnit.label, color: "#8a96a4" },
              grid: { color: "rgba(255,255,255,0.05)" } },
       },
       plugins: {
         legend: { labels: { color: "#d7dee6" } },
         tooltip: { callbacks: {
+          title: (items) => binRange(items[0].parsed.x),
           label: (ctx) => `${ctx.dataset.label}: ${fmtBytes(ctx.parsed.y)}`
-            + (ctx.parsed.x >= nowBinMs ? " (bin still filling)" : ""),
+            + (ctx.parsed.x >= nowBinCenterMs ? " (bin still filling)" : ""),
         } },
       },
     },

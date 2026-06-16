@@ -153,6 +153,10 @@ class NetflowCollector:
         self._reason_bytes: dict[str, int] = {}
         self.last_packet_ts: int = 0
         self.last_router_addr: str | None = None
+        # Export version of the most recent packet (10 = IPFIX/NetFlow v10,
+        # 9 = NetFlow v9). Lets the diagnostics panel confirm the router is
+        # actually sending the format it's configured for.
+        self.last_version: int | None = None
 
     async def start(self, port: int) -> None:
         loop = asyncio.get_running_loop()
@@ -181,6 +185,8 @@ class NetflowCollector:
         self.packets_received += 1
         self.last_packet_ts = int(time.time())
         self.last_router_addr = addr[0] if addr else None
+        if len(data) >= 2:
+            self.last_version = (data[0] << 8) | data[1]  # first 2 bytes = version
         try:
             records = parse_packet(data, self._templates)
         except Exception:
@@ -395,6 +401,7 @@ class NetflowCollector:
             "last_packet_ts": self.last_packet_ts,
             "last_packet_age_s": (int(time.time()) - self.last_packet_ts) if self.last_packet_ts else None,
             "last_router_addr": self.last_router_addr,
+            "last_version": self.last_version,
             # Disposition histograms. `reasons_with_bytes` is the one to
             # read: it shows what happens to records that actually carry
             # byte counts (the 0-byte flow-creation records are noise).

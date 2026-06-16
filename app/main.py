@@ -114,14 +114,17 @@ async def _tcp_reachable(host: str, port: int, timeout: float = 4.0) -> tuple[bo
         return False, f"{type(e).__name__}: {e}"
 
 
+_VERSION_LABEL = {10: "IPFIX (v10)", 9: "NetFlow v9"}
+
+
 @app.get("/api/diagnostics")
 async def diagnostics() -> dict:
     """Health + data-quality checks for the settings panel, focused on the
     questions that actually come up in operation: is the router link up, is
-    NetFlow arriving, WHERE are the bytes being credited (the accuracy lens —
-    this is the row that explains a download that never showed up), and is
-    the live rate poller covering active devices. Each row is
-    {id,label,status,detail[,hint]}; status is ok | warn | fail | info."""
+    flow data arriving (and in the expected format), WHERE are the bytes being
+    credited (the accuracy lens — the row that explains a download that never
+    showed up), and is the DB healthy. Each row is {id,label,status,detail
+    [,hint]}; status is ok | warn | fail | info."""
     now = int(time.time())
     nf = netflow.stats()
     checks: list[dict] = []
@@ -161,28 +164,35 @@ async def diagnostics() -> dict:
                 "'no matching cipher', widen LEGACY_SSH_KWARGS in app/collectors/ssh.py.",
             ))
 
-    # --- NetFlow ingest: listener + packet flow in one row.
+    # --- Flow ingest: listener + packet flow + export format in one row.
     age = nf["last_packet_age_s"]
     if not nf["listening_port"]:
         checks.append(_check(
-            "nf", "NetFlow ingest", "fail",
+            "nf", "Flow ingest", "fail",
             "listener not bound — check NETFLOW_PORT and that nothing else owns the port",
         ))
     elif nf["packets_received"] == 0:
         checks.append(_check(
-            "nf", "NetFlow ingest", "warn",
+            "nf", "Flow ingest", "warn",
             f"listening on udp/{nf['listening_port']} but 0 packets received",
             "Router: System Maintenance → NetFlow → Collector IP = this host, "
-            f"Port {settings.netflow_port}, v9. Test rig: run tools/netflow_sim.py.",
+            f"Port {settings.netflow_port}, version IPFIX (or v9).",
         ))
     else:
         fresh = age is not None and age < 30
+        fmt = _VERSION_LABEL.get(nf.get("last_version"), f"v{nf.get('last_version')}")
+        errored = nf.get("records_errored", 0)
+        detail = (f"{fmt} • {nf['packets_received']} packets / {nf['records_parsed']} records, "
+                  f"{len(nf['templates_known'])} templates; last packet {age}s ago"
+                  + ("" if fresh else " (stale)")
+                  + (f"; from {nf['last_router_addr']}" if nf["last_router_addr"] else ""))
+        if errored:
+            detail += f" • {errored} parse/attribute errors"
         checks.append(_check(
-            "nf", "NetFlow ingest", "ok" if fresh else "warn",
-            f"{nf['packets_received']} packets / {nf['records_parsed']} records, "
-            f"{len(nf['templates_known'])} templates; last packet {age}s ago"
-            + ("" if fresh else " (stale)")
-            + (f"; from {nf['last_router_addr']}" if nf["last_router_addr"] else ""),
+            "nf", "Flow ingest", "ok" if (fresh and not errored) else "warn", detail,
+            None if not errored else
+            "Records are failing mid-attribution — a parser/template mismatch. "
+            "Check container logs and /api/netflow/recent.",
         ))
 
     # --- Byte attribution: where the traffic volume is actually landing.
@@ -219,13 +229,16 @@ async def diagnostics() -> dict:
         checks.append(_check("nf_bytes", "Byte attribution", "info",
                              "no byte-carrying flow records yet"))
 
-    # --- Database.
+    # --- Database: writable, and how much history it actually holds.
     try:
         counts = db.table_counts()
+        oldest = counts.get("oldest_sample_ts")
+        span = (f"{(now - oldest) / 86400:.1f}d of history (retention {settings.retention_days}d)"
+                if oldest else "no samples yet")
         checks.append(_check(
             "db", "Database", "ok",
             f"{counts['devices']} devices, {counts['samples']} flow samples, "
-            f"{counts['wan_samples']} WAN samples at {settings.db_path}",
+            f"{counts['wan_samples']} WAN samples • {span} • {settings.db_path}",
         ))
     except Exception as e:
         checks.append(_check("db", "Database", "fail", f"{type(e).__name__}: {e}"))

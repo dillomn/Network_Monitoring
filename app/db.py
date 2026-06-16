@@ -199,6 +199,9 @@ def table_counts() -> dict:
             "devices": c.execute("SELECT COUNT(*) AS n FROM devices").fetchone()["n"],
             "samples": c.execute("SELECT COUNT(*) AS n FROM samples").fetchone()["n"],
             "wan_samples": c.execute("SELECT COUNT(*) AS n FROM wan_samples").fetchone()["n"],
+            # Oldest sample timestamp — how far back the history actually
+            # reaches (vs the configured retention). None when empty.
+            "oldest_sample_ts": c.execute("SELECT MIN(ts) AS t FROM samples").fetchone()["t"],
         }
 
 

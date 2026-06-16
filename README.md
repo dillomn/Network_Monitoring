@@ -12,10 +12,22 @@ Built and tested against the **Vigor 2762n** and **Vigor 2765 series**.
 - Web UI at `http://<pi-ip>:8090`: summary tiles (network rate now, 24 h volume, devices online, top consumer), a device list led by **transfer volumes** (1 h / 24 h) with current rates and an **"in progress…"** badge for devices with open NAT sessions but no measurements yet, a network-wide usage chart, and per-device volume + rate charts that line up on a shared time axis with the trailing ~2 minutes shaded ("data still arriving").
 - **Settings ⚙** (header gear) runs live diagnostics — router link, IPFIX ingest, byte attribution, DB — backed by `/api/diagnostics`.
 
-> **Data source:** per-device traffic comes **only** from IPFIX/NetFlow. SSH supplies
-> device identity (DHCP/ARP), WAN totals (`show statistic`), and the NAT port-map — it
-> does **not** measure per-device traffic. The `show traffic <ip>` CLI path survives
-> solely in the `/debug/ssh/*` endpoints for cross-checking.
+### Data sources
+
+Every value shown in the UI comes from one of two places: the **IPFIX/NetFlow** export (per-device traffic) or the **SSH** poll (everything else). Nothing else is in use — in particular there is **no sFlow** (it's only a possible future addition, see *Limitations*) and the `show traffic <ip>` Data Flow Monitor CLI is used *only* by the `/debug/ssh/*` cross-check endpoints, never on the live data path.
+
+| Data shown in the UI | Source | How it's obtained |
+|---|---|---|
+| Device **rate** (TX/RX "now") | IPFIX/NetFlow | Latest per-device flow sample bucket, if fresh (≤30 s old) |
+| Device **volume** (1 h / 24 h columns) | IPFIX/NetFlow | Sum of per-device flow byte totals over the window |
+| Per-device **rate & volume charts** | IPFIX/NetFlow | Flow byte totals bucketed over time (rate shape is a uniform estimate — see below) |
+| Network-wide **usage chart** + tiles | IPFIX/NetFlow | All devices' flow bytes summed per time bin |
+| Device **identity** (name, IP, MAC, vendor) | SSH | `srv dhcp status` + `ip arp status` (vendor from MAC OUI) |
+| **WAN totals** (header ↑/↓) | SSH | `show statistic` lifetime byte counters, delta'd between polls |
+| **"in progress…"** badge | SSH | Open NAT sessions from `show portmap` (a device is active but its flow hasn't ended yet) |
+| NAT reverse-attribution (inbound flows) | SSH | `show portmap` maps the router's WAN-side IP/port back to the LAN device |
+
+In short: **per-device traffic numbers = NetFlow; device names/IPs and WAN totals = SSH.**
 
 ### Reading the numbers
 

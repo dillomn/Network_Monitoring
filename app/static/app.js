@@ -225,7 +225,7 @@ const GAP_S = 30;
 // isn't read as "zero traffic".
 const LIVE_EDGE_S = 120;
 
-function fillGaps(points) {
+function fillGaps(points, nowSArg) {
   if (!points.length) return points;
   const out = [];
   for (let i = 0; i < points.length; i++) {
@@ -239,8 +239,9 @@ function fillGaps(points) {
   // Trailing edge: short flows export within seconds of ending, so a quiet
   // stretch up to the live-edge window really was (close to) zero. Inside the
   // window nothing is known yet — leave it blank under the shaded band rather
-  // than drawing zeros that may be backfilled away.
-  const nowS = Date.now() / 1000;
+  // than drawing zeros that may be backfilled away. `nowSArg` is the server
+  // window end (same clock as the data); fall back to the browser clock.
+  const nowS = nowSArg ?? Date.now() / 1000;
   const last = out[out.length - 1];
   if (nowS - LIVE_EDGE_S - last.ts > GAP_S) {
     out.push({ ts: last.ts + 1, tx_bps: 0, rx_bps: 0 });
@@ -264,6 +265,12 @@ const timeScaleFor = (hours) => ({
 const Y_AXIS_WIDTH = 68;
 const yAxisFit = (scale) => { scale.width = Y_AXIS_WIDTH; };
 
+// The [min, max] epoch-ms window both charts of a pair share. Built from the
+// server's `since` (the data is server-timestamped) + the selected range, so
+// the rate line and the volume bars map time→pixel identically and line up
+// exactly. `since + hours*3600` is the server's "now".
+const windowMs = (since, hours) => [since * 1000, (since + (hours || 1) * 3600) * 1000];
+
 // Chart.js inline plugin: translucent band over the last LIVE_EDGE_S where
 // flow records may not have arrived yet.
 const liveEdgePlugin = {
@@ -272,7 +279,10 @@ const liveEdgePlugin = {
     const x = chart.scales.x;
     if (!x) return;
     const area = chart.chartArea;
-    const nowMs = Date.now();
+    // Anchor the band to the axis's right edge (server "now"), not the
+    // browser clock, so it sits exactly at the end of the data regardless
+    // of any Pi/browser clock skew.
+    const nowMs = x.max;
     const from = Math.max(x.getPixelForValue(nowMs - LIVE_EDGE_S * 1000), area.left);
     const to = Math.min(x.getPixelForValue(nowMs), area.right);
     if (to <= from) return;
@@ -296,8 +306,8 @@ const liveEdgePlugin = {
   },
 };
 
-function chartConfig(label, points, hours) {
-  points = fillGaps(points);
+function chartConfig(label, points, hours, winMinMs, winMaxMs) {
+  points = fillGaps(points, winMaxMs / 1000);
   const peak = points.reduce((m, p) => Math.max(m, p.tx_bps || 0, p.rx_bps || 0), 0);
   const yUnit = pickAxisUnit(peak);
   return {
@@ -323,10 +333,10 @@ function chartConfig(label, points, hours) {
     options: {
       responsive: true, maintainAspectRatio: false, animation: false,
       scales: {
-        // Pin the axis to the full selected window (matching the volume bars
-        // above it) and to "now" so the shaded not-yet-reported edge shows.
+        // Identical [min, max] window to the volume chart (server clock) so
+        // the two stacked charts line up pixel-for-pixel.
         x: { type: "time",
-             min: Date.now() - (hours || 1) * 3600e3, max: Date.now(),
+             min: winMinMs, max: winMaxMs,
              time: { ...timeScaleFor(hours || 1), tooltipFormat: "MMM d, HH:mm:ss" },
              ticks: { color: "#8a96a4" }, grid: { color: "rgba(255,255,255,0.05)" } },
         y: { afterFit: yAxisFit,
@@ -348,10 +358,10 @@ function chartConfig(label, points, hours) {
 // sizing — Chart.js "flex" thickness sizes bars from the spacing between
 // adjacent points, so with only sparse non-zero bins an isolated bar would
 // stretch to fill the whole gap. Dense bins = every bar exactly one slot wide.
-function fillUsageBins(points, bucketS, sinceTs) {
+function fillUsageBins(points, bucketS, startS, endS) {
   const byTs = new Map(points.map(p => [p.ts, p]));
-  const start = Math.ceil(sinceTs / bucketS) * bucketS;
-  const end = Math.floor(Date.now() / 1000 / bucketS) * bucketS;
+  const start = Math.ceil(startS / bucketS) * bucketS;
+  const end = Math.floor(endS / bucketS) * bucketS;
   const out = [];
   for (let t = start; t <= end; t += bucketS) {
     out.push(byTs.get(t) || { ts: t, tx_bytes: 0, rx_bytes: 0 });
@@ -366,11 +376,11 @@ function fillUsageBins(points, bucketS, sinceTs) {
 // interval it represents (a 7–8 AM bin covers 7:00–8:00, not 6:30–7:30), and
 // the axis is pinned to the same [since, now] window the rate chart uses —
 // the two charts in the modal must line up when read side by side.
-function usageChartConfig(points, bucketS, sinceTs, hours) {
-  points = fillUsageBins(points, bucketS, sinceTs);
+function usageChartConfig(points, bucketS, hours, winMinMs, winMaxMs) {
+  const startS = winMinMs / 1000, endS = winMaxMs / 1000;
+  points = fillUsageBins(points, bucketS, startS, endS);
   const halfBinMs = bucketS * 500;
-  const nowBinCenterMs =
-    Math.floor(Date.now() / 1000 / bucketS) * bucketS * 1000 + halfBinMs;
+  const nowBinCenterMs = Math.floor(endS / bucketS) * bucketS * 1000 + halfBinMs;
   const fade = (base, faded) => (ctx) => (ctx.raw && ctx.raw.x >= nowBinCenterMs ? faded : base);
   const peak = points.reduce((m, p) => Math.max(m, (p.tx_bytes || 0) + (p.rx_bytes || 0)), 0);
   const yUnit = pickByteUnit(peak);
@@ -404,7 +414,7 @@ function usageChartConfig(points, bucketS, sinceTs, hours) {
       responsive: true, maintainAspectRatio: false, animation: false,
       scales: {
         x: { type: "time", stacked: true,
-             min: sinceTs * 1000, max: Date.now(),
+             min: winMinMs, max: winMaxMs,
              time: timeScaleFor(hours || 1),
              ticks: { color: "#8a96a4" }, grid: { color: "rgba(255,255,255,0.05)" } },
         y: { stacked: true, beginAtZero: true, afterFit: yAxisFit,
@@ -434,7 +444,8 @@ async function refreshMainChart() {
   document.getElementById("chart-title").textContent =
     `Network usage — ${fmtBytes(totalBytes)} in last ${hours}h (per ${USAGE_BUCKET_LABEL[hours] || "bin"})`;
   if (mainChart) mainChart.destroy();
-  mainChart = new Chart(ctx, usageChartConfig(data.points, bucketS, data.since, hours));
+  const [winMin, winMax] = windowMs(data.since, hours);
+  mainChart = new Chart(ctx, usageChartConfig(data.points, bucketS, hours, winMin, winMax));
 }
 
 function updateModalHeader(d) {
@@ -454,26 +465,34 @@ function updateModalHeader(d) {
 const USAGE_BUCKET_S = { 1: 300, 6: 1800, 24: 3600, 168: 21600, 720: 86400 };
 const USAGE_BUCKET_LABEL = { 1: "5 min", 6: "30 min", 24: "hour", 168: "6 h", 720: "day" };
 
-async function refreshModalChart() {
-  if (!selectedMac) return;
-  const hours = parseInt(document.getElementById("m-range").value, 10);
-  const data = await fetchJSON(`/api/devices/${encodeURIComponent(selectedMac)}/history?hours=${hours}`);
-  const ctx = document.getElementById("m-chart").getContext("2d");
-  if (modalChart) modalChart.destroy();
-  modalChart = new Chart(ctx, chartConfig(null, data.points, hours));
-}
-
-async function refreshModalUsage() {
-  if (!selectedMac) return;
+// Rate (line) + volume (bars) for the selected device. Both are fetched
+// together and handed the SAME [min, max] window, so their time axes line up
+// pixel-for-pixel — read one straight above the other to match rate to volume.
+async function refreshModalCharts() {
+  const mac = selectedMac;
+  if (!mac) return;
   const hours = parseInt(document.getElementById("m-range").value, 10);
   const bucketS = USAGE_BUCKET_S[hours] || 3600;
-  const data = await fetchJSON(
-    `/api/devices/${encodeURIComponent(selectedMac)}/usage?hours=${hours}&bucket_s=${bucketS}`);
+  const enc = encodeURIComponent(mac);
+  const [hist, usage] = await Promise.all([
+    fetchJSON(`/api/devices/${enc}/history?hours=${hours}`),
+    fetchJSON(`/api/devices/${enc}/usage?hours=${hours}&bucket_s=${bucketS}`),
+  ]);
+  if (selectedMac !== mac) return;  // modal closed or switched mid-fetch
+  // One window for both charts (usage.since == hist.since to within the gap
+  // between the two requests — pick one so the axes are byte-identical).
+  const [winMin, winMax] = windowMs(usage.since, hours);
+
   document.getElementById("m-usage-note").textContent =
     `— bytes moved per ${USAGE_BUCKET_LABEL[hours] || "bin"}; faded bar = bin still filling`;
-  const ctx = document.getElementById("m-usage-chart").getContext("2d");
+
+  const rateCtx = document.getElementById("m-chart").getContext("2d");
+  if (modalChart) modalChart.destroy();
+  modalChart = new Chart(rateCtx, chartConfig(null, hist.points, hours, winMin, winMax));
+
+  const usageCtx = document.getElementById("m-usage-chart").getContext("2d");
   if (modalUsageChart) modalUsageChart.destroy();
-  modalUsageChart = new Chart(ctx, usageChartConfig(data.points, bucketS, data.since, hours));
+  modalUsageChart = new Chart(usageCtx, usageChartConfig(usage.points, bucketS, hours, winMin, winMax));
 }
 
 async function openDeviceModal(mac) {
@@ -481,7 +500,7 @@ async function openDeviceModal(mac) {
   const d = devices.find(x => x.mac === mac);
   if (d) updateModalHeader(d);
   document.getElementById("modal").classList.remove("hidden");
-  await Promise.all([refreshModalChart(), refreshModalUsage()]);
+  await refreshModalCharts();
   renderDeviceTable();
 }
 
@@ -499,10 +518,7 @@ document.getElementById("modal").addEventListener("click", (e) => {
 });
 document.getElementById("filter").addEventListener("input", renderDeviceTable);
 document.getElementById("range").addEventListener("change", refreshMainChart);
-document.getElementById("m-range").addEventListener("change", () => {
-  refreshModalChart();
-  refreshModalUsage();
-});
+document.getElementById("m-range").addEventListener("change", refreshModalCharts);
 document.getElementById("m-save-note").addEventListener("click", async () => {
   if (!selectedMac) return;
   const note = document.getElementById("m-note").value;
@@ -578,7 +594,7 @@ document.querySelectorAll("#device-table th.sortable").forEach(th => {
 
 async function tick() {
   await Promise.all([refreshHealth(), refreshDevices()]);
-  if (selectedMac) await Promise.all([refreshModalChart(), refreshModalUsage()]);
+  if (selectedMac) await refreshModalCharts();
   await refreshMainChart();
 }
 

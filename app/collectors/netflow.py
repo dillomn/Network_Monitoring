@@ -67,12 +67,6 @@ SAMPLE_BUCKET_S = db.SAMPLE_BUCKET_S
 # fanning out into millions of buckets; a genuine transfer is well under this.
 MAX_SPREAD_S = 6 * 3600
 
-# How long one Data Flow Monitor reading is assumed to describe the device's
-# rate, looking backwards from the reading's timestamp. Readings arrive every
-# ~N seconds (N = devices in the poller's DFM rotation), so this needs to be
-# a bit above the typical cadence or the profile gets holes.
-PROFILE_HOLD_S = 20.0
-
 
 def _is_lan(ip: str) -> bool:
     try:
@@ -143,12 +137,6 @@ class NetflowCollector:
         # Should be 0; anything else means a per-record bug we're now
         # surviving instead of silently dropping the rest of the packet.
         self.records_errored: int = 0
-        # How multi-bucket flows were distributed: shaped = proportional to
-        # measured DFM readings (true shape), uniform = flat average fallback
-        # (no usable readings for the window). shaped should dominate for
-        # devices the DFM rotation covers.
-        self.flows_spread_shaped: int = 0
-        self.flows_spread_uniform: int = 0
         # Disposition tally over ALL records, and separately over only the
         # records that actually carried bytes. The byte-bearing breakdown
         # is the real diagnostic: it ignores the flood of 0-byte
@@ -313,19 +301,16 @@ class NetflowCollector:
     def _credit(
         self, mac: str, tx_add: int, rx_add: int, start_wall: float, end_wall: float
     ) -> None:
-        """Distribute a flow record's bytes across the sample buckets covering
-        [start_wall, end_wall]. A zero/absent duration (start == end) drops
-        everything in the single bucket at end_wall.
+        """Spread a flow record's bytes across the sample buckets covering the
+        wall-clock interval [start_wall, end_wall], in proportion to how much of
+        the flow falls in each bucket. A zero/absent duration (start == end)
+        drops everything in the single bucket at end_wall.
 
-        Distribution prefers the MEASURED shape: if the poller's Data Flow
-        Monitor readings cover this window, each direction's bytes are split
-        proportionally to those readings — a download that ran 100 Mbps then
-        5 Mbps charts as exactly that, not as a flat average. The flow record
-        still anchors the exact byte total (the weights are normalised, so
-        even a miscalibrated TRAFFIC_UNIT can't change the magnitude — only
-        the shape). Without usable readings, falls back to a uniform spread,
-        which at least puts the bytes in the right interval at the right
-        average rate."""
+        Splitting by time is the whole fix: a 1.6 GB download exported as one
+        283 s record becomes ~45 Mbps across ~28 buckets instead of a 200 Mbps
+        spike in the one bucket it happened to arrive in. The byte total is
+        exact; the shape WITHIN the flow is assumed uniform, because the
+        flow-end record is all the router tells us about it."""
         if tx_add <= 0 and rx_add <= 0:
             return
         if end_wall - start_wall > MAX_SPREAD_S:
@@ -333,71 +318,14 @@ class NetflowCollector:
         if end_wall <= start_wall:
             self._deposit(mac, _bucket(end_wall), float(tx_add), float(rx_add))
             return
-
-        # Uniform fractions — the fallback, and the base for any direction
-        # whose measured profile is empty/all-zero.
         span = end_wall - start_wall
-        uniform: dict[int, float] = {}
         t = start_wall
         while t < end_wall:
             b = _bucket(t)
             seg_end = min(end_wall, b + SAMPLE_BUCKET_S)
-            uniform[b] = uniform.get(b, 0.0) + (seg_end - t) / span
+            frac = (seg_end - t) / span
+            self._deposit(mac, b, tx_add * frac, rx_add * frac)
             t = seg_end
-
-        tx_frac = rx_frac = uniform
-        profile = self._rate_profile(mac, start_wall, end_wall)
-        if profile:
-            tx_sum = sum(w[0] for w in profile.values())
-            rx_sum = sum(w[1] for w in profile.values())
-            if tx_sum > 0:
-                tx_frac = {b: w[0] / tx_sum for b, w in profile.items()}
-            if rx_sum > 0:
-                rx_frac = {b: w[1] / rx_sum for b, w in profile.items()}
-        if tx_frac is uniform and rx_frac is uniform:
-            self.flows_spread_uniform += 1
-        else:
-            self.flows_spread_shaped += 1
-
-        for b in set(tx_frac) | set(rx_frac):
-            self._deposit(mac, b, tx_add * tx_frac.get(b, 0.0), rx_add * rx_frac.get(b, 0.0))
-
-    def _rate_profile(self, mac: str, start: float, end: float) -> dict[int, list[float]] | None:
-        """Per-bucket weights from the poller's recent DFM readings for this
-        device, or None if nothing usable overlaps [start, end]. Each reading
-        is treated as describing the PROFILE_HOLD_S seconds behind it; its
-        rate × covered-duration accumulates into the buckets it overlaps.
-        Only the relative shape matters — _credit normalises the weights."""
-        try:
-            from ..poller import poller as _poller
-            hist = _poller.live_history.get(mac)
-        except Exception:
-            return None
-        if not hist:
-            return None
-        weights: dict[int, list[float]] = {}
-        any_nonzero = False
-        for ts, tx, rx in hist:
-            seg_start = max(start, ts - PROFILE_HOLD_S)
-            seg_end = min(end, ts)
-            if seg_end <= seg_start:
-                continue
-            if tx > 0 or rx > 0:
-                any_nonzero = True
-            t = seg_start
-            while t < seg_end:
-                b = _bucket(t)
-                step_end = min(seg_end, b + SAMPLE_BUCKET_S)
-                acc = weights.setdefault(b, [0.0, 0.0])
-                dur = step_end - t
-                acc[0] += tx * dur
-                acc[1] += rx * dur
-                t = step_end
-        # All-zero coverage means the DFM saw the device idle while the flow
-        # record says bytes moved — distrust the profile, use uniform.
-        if not weights or not any_nonzero:
-            return None
-        return weights
 
     def _deposit(self, mac: str, bucket_ts: int, tx: float, rx: float) -> None:
         acc = self._pending.get((mac, bucket_ts))
@@ -464,8 +392,6 @@ class NetflowCollector:
             "records_parsed": self.records_parsed,
             "records_processed": self.records_processed,
             "records_errored": self.records_errored,
-            "flows_spread_shaped": self.flows_spread_shaped,
-            "flows_spread_uniform": self.flows_spread_uniform,
             "last_packet_ts": self.last_packet_ts,
             "last_packet_age_s": (int(time.time()) - self.last_packet_ts) if self.last_packet_ts else None,
             "last_router_addr": self.last_router_addr,

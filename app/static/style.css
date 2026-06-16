@@ -36,7 +36,7 @@ header h1 { font-size: 16px; margin: 0; letter-spacing: 0.02em; }
 main {
   display: grid;
   /* Devices panel gets more room than the chart — the table has 7 columns
-     and the rate cells need space for the live dot + value. */
+     (device, IP, MAC, TX, RX, 1h vol, 24h vol). */
   grid-template-columns: minmax(520px, 1fr) 1.6fr;
   grid-template-rows: auto minmax(0, 1fr);
   gap: 12px;
@@ -120,11 +120,6 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .pending {
   color: var(--warn); font-size: 11px; font-weight: 600;
   letter-spacing: 0.04em; cursor: help;
-}
-/* Rate comes from a fresh Data Flow Monitor reading (live), not NetFlow. */
-.dot-live {
-  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
-  background: var(--good); margin-right: 6px; vertical-align: middle;
 }
 
 .chart-wrap { flex: 1; padding: 12px; min-height: 0; position: relative; }

@@ -36,21 +36,6 @@ CREATE TABLE IF NOT EXISTS wan_samples (
     rx_bps REAL NOT NULL
 );
 
--- Live per-device rates from the router's Data Flow Monitor (`show traffic
--- <ip>` over SSH), bucketed like `samples`. This is the fallback layer that
--- makes in-progress transfers visible: the NetFlow exporter reports a flow
--- only when it ENDS, so mid-download these rows are the only signal. Queries
--- merge the two with per-bucket MAX — NetFlow's exact figures win wherever
--- they exist, DFM estimates fill the holes (in-flight flows, or flows the
--- exporter never reported at all).
-CREATE TABLE IF NOT EXISTS live_samples (
-    mac TEXT NOT NULL,
-    ts INTEGER NOT NULL,
-    tx_bps REAL NOT NULL,
-    rx_bps REAL NOT NULL,
-    PRIMARY KEY (mac, ts)
-) WITHOUT ROWID;
-
 CREATE INDEX IF NOT EXISTS idx_samples_mac_ts ON samples(mac, ts);
 CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(ts);
 CREATE INDEX IF NOT EXISTS idx_wan_samples_wan_ts ON wan_samples(wan, ts);
@@ -171,20 +156,21 @@ def list_devices_with_current() -> list[dict]:
             ORDER BY (tx_bps + rx_bps) DESC NULLS LAST, d.hostname
             """
         ).fetchall()
-        # Transfer volumes over the trailing 1h/24h windows, from the merged
-        # series (see _merged_series_sql): NetFlow-exact where flow records
-        # landed, DFM-estimated where only live readings exist. Each row is a
-        # rate over one SAMPLE_BUCKET_S bucket, so bytes = rate × bucket ÷ 8.
+        # Exact transfer volumes over the trailing 1h/24h windows. Each sample
+        # row is a rate over one SAMPLE_BUCKET_S bucket, so bytes come back out
+        # as rate × bucket ÷ 8. Unlike the "current" rate (which is shaped by
+        # the uniform-spread assumption), these sums are conserved — they equal
+        # what the flow records reported.
         vols = c.execute(
-            f"""
+            """
             SELECT mac,
                    SUM(CASE WHEN ts >= :h1 THEN tx_bps ELSE 0 END) * :w / 8.0 AS vol_tx_1h,
                    SUM(CASE WHEN ts >= :h1 THEN rx_bps ELSE 0 END) * :w / 8.0 AS vol_rx_1h,
                    SUM(tx_bps) * :w / 8.0 AS vol_tx_24h,
                    SUM(rx_bps) * :w / 8.0 AS vol_rx_24h
-            FROM ({_merged_series_sql(per_mac=False)}) GROUP BY mac
+            FROM samples WHERE ts >= :h24 GROUP BY mac
             """,
-            {"h1": h1, "since": h24, "w": SAMPLE_BUCKET_S},
+            {"h1": h1, "h24": h24, "w": SAMPLE_BUCKET_S},
         ).fetchall()
     vol_by_mac = {v["mac"]: v for v in vols}
     out = []
@@ -212,7 +198,6 @@ def table_counts() -> dict:
         return {
             "devices": c.execute("SELECT COUNT(*) AS n FROM devices").fetchone()["n"],
             "samples": c.execute("SELECT COUNT(*) AS n FROM samples").fetchone()["n"],
-            "live_samples": c.execute("SELECT COUNT(*) AS n FROM live_samples").fetchone()["n"],
             "wan_samples": c.execute("SELECT COUNT(*) AS n FROM wan_samples").fetchone()["n"],
         }
 
@@ -225,45 +210,12 @@ def mac_for_ip(ip: str) -> str | None:
     return row["mac"] if row else None
 
 
-def upsert_live_sample(mac: str, bucket_ts: int, tx_bps: float, rx_bps: float) -> None:
-    """Store one Data Flow Monitor reading for a (mac, bucket). REPLACE: a
-    newer reading within the same bucket supersedes the older one. These rows
-    are the live fallback layer — merged queries take the per-bucket MAX of
-    samples vs live_samples, so NetFlow's exact figures win once they arrive."""
-    with conn() as c:
-        c.execute(
-            "INSERT OR REPLACE INTO live_samples (mac, ts, tx_bps, rx_bps) VALUES (?, ?, ?, ?)",
-            (mac, bucket_ts, tx_bps, rx_bps),
-        )
-
-
-def _merged_series_sql(per_mac: bool) -> str:
-    """Subquery merging NetFlow `samples` with the live DFM fallback, one row
-    per (mac, ts) bucket, MAX per direction. Why MAX and not COALESCE-prefer-
-    NetFlow: while a long flow is still open, NetFlow only has the device's
-    background chatter for those buckets (tiny), and the DFM reading carries
-    the real rate — preferring any NetFlow row would zero out the download.
-    MAX keeps the live estimate until the flow-end record backfills a larger
-    (exact) figure into the same buckets. Callers bind :since (and :mac)."""
-    mac_filter = "AND mac = :mac" if per_mac else ""
-    return f"""
-        SELECT mac, ts, MAX(tx_bps) AS tx_bps, MAX(rx_bps) AS rx_bps FROM (
-            SELECT mac, ts, tx_bps, rx_bps FROM samples
-                WHERE ts >= :since {mac_filter}
-            UNION ALL
-            SELECT mac, ts, tx_bps, rx_bps FROM live_samples
-                WHERE ts >= :since {mac_filter}
-        ) GROUP BY mac, ts
-    """
-
-
 def history_for(mac: str, since_ts: int) -> list[dict]:
-    """Per-bucket rate series for one device, merged from NetFlow samples and
-    live DFM readings (see _merged_series_sql)."""
+    """Per-bucket rate series for one device."""
     with conn() as c:
         rows = c.execute(
-            f"SELECT ts, tx_bps, rx_bps FROM ({_merged_series_sql(per_mac=True)}) ORDER BY ts ASC",
-            {"mac": mac, "since": since_ts},
+            "SELECT ts, tx_bps, rx_bps FROM samples WHERE mac = ? AND ts >= ? ORDER BY ts ASC",
+            (mac, since_ts),
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -271,15 +223,15 @@ def history_for(mac: str, since_ts: int) -> list[dict]:
 def usage_for(mac: str, since_ts: int, bucket_s: int) -> list[dict]:
     """Transfer volume per `bucket_s`-wide bin: [{ts, tx_bytes, rx_bytes}].
     `ts` is the bin start (epoch, aligned to bucket_s). Bins with no samples
-    are omitted. Built on the merged series: NetFlow-exact where flow records
-    landed, DFM-estimated where only live readings exist."""
+    are omitted. Volumes are exact — the honest "when did the bytes move" view,
+    vs. the rate chart whose shape inside a long flow is a uniform estimate."""
     with conn() as c:
         rows = c.execute(
-            f"""
+            """
             SELECT (ts / :b) * :b AS bucket,
                    SUM(tx_bps) * :w / 8.0 AS tx_bytes,
                    SUM(rx_bps) * :w / 8.0 AS rx_bytes
-            FROM ({_merged_series_sql(per_mac=True)})
+            FROM samples WHERE mac = :mac AND ts >= :since
             GROUP BY bucket ORDER BY bucket ASC
             """,
             {"b": int(bucket_s), "w": SAMPLE_BUCKET_S, "mac": mac, "since": since_ts},
@@ -292,11 +244,11 @@ def usage_total(since_ts: int, bucket_s: int) -> list[dict]:
     page's "when was the network busy" chart."""
     with conn() as c:
         rows = c.execute(
-            f"""
+            """
             SELECT (ts / :b) * :b AS bucket,
                    SUM(tx_bps) * :w / 8.0 AS tx_bytes,
                    SUM(rx_bps) * :w / 8.0 AS rx_bytes
-            FROM ({_merged_series_sql(per_mac=False)})
+            FROM samples WHERE ts >= :since
             GROUP BY bucket ORDER BY bucket ASC
             """,
             {"b": int(bucket_s), "w": SAMPLE_BUCKET_S, "since": since_ts},
@@ -309,8 +261,7 @@ def prune_old_samples(retention_days: int) -> int:
     with conn() as c:
         a = c.execute("DELETE FROM samples WHERE ts < ?", (cutoff,)).rowcount
         b = c.execute("DELETE FROM wan_samples WHERE ts < ?", (cutoff,)).rowcount
-        d = c.execute("DELETE FROM live_samples WHERE ts < ?", (cutoff,)).rowcount
-        return a + b + d
+        return a + b
 
 
 def set_device_note(mac: str, note: str) -> None:

@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import time
-from collections import deque
 from contextlib import asynccontextmanager
 
 import asyncssh
@@ -21,12 +20,6 @@ _TRANSPORT_ERRORS = (
     EOFError,
     OSError,
 )
-
-# Max devices in one Data Flow Monitor rotation pass. One device is polled per
-# poll cycle (2 CLI commands), so with the default 1 s interval a device's
-# live rate refreshes roughly every N seconds where N = active device count
-# (capped here). Devices are prioritised by open NAT session count.
-DFM_MAX_DEVICES = 12
 
 
 class Poller:
@@ -62,22 +55,6 @@ class Poller:
         # 1s poll_interval that's 5s, which is fast enough for NAT entries
         # to be there when a flow record using them arrives.
         self._portmap_poll_every: int = 5
-        # Live per-device rates from the router's Data Flow Monitor:
-        # {mac: (tx_bps, rx_bps, reading_ts)}. The "now" display prefers
-        # these over NetFlow-derived rates because the flow exporter says
-        # nothing about a transfer until it ends.
-        self.live_rates: dict[str, tuple[float, float, int]] = {}
-        # Recent reading history per device: {mac: deque[(ts, tx_bps, rx_bps)]}.
-        # The NetFlow collector uses this as the measured rate PROFILE when a
-        # flow-end record arrives: instead of spreading the flow's bytes
-        # uniformly over its duration, it distributes them proportionally to
-        # these readings — measured shape, exact total. Zero readings are kept
-        # on purpose (a measured zero shapes the profile too). ~6 h at one
-        # reading per 10 s.
-        self.live_history: dict[str, deque] = {}
-        self.dfm_last_ts: int = 0
-        # IPs still to poll in the current DFM rotation pass.
-        self._dfm_rotation: list[str] = []
 
     async def start(self) -> None:
         db.init_db()
@@ -168,12 +145,10 @@ class Poller:
 
     async def _poll_once(self) -> None:
         """SSH side of the pipeline, all over the one SSH session: device
-        discovery (DHCP + ARP), WAN totals, the NAT port-map, and one live
-        Data Flow Monitor reading per cycle (round-robin over active devices).
-        Discovery and the port-map feed the NetFlow collector's attribution;
-        the DFM readings are the live per-device rate source — NetFlow only
-        reports a flow when it ends, so mid-transfer the DFM is the only
-        signal (see _poll_dfm_one)."""
+        discovery (DHCP + ARP), WAN totals, and the NAT port-map. Discovery
+        gives the NetFlow collector its IP→MAC map; the port-map lets it
+        reverse-NAT inbound records. Per-device traffic is NOT read over SSH —
+        the NetFlow listener owns it (see app/collectors/netflow.py)."""
         session = await self._ensure_session()
 
         if self.router_model is None:
@@ -189,47 +164,6 @@ class Poller:
 
         await self._update_wan_rate(session)
         await self._maybe_update_portmap(session)
-        await self._poll_dfm_one(session)
-
-    async def _poll_dfm_one(self, session: DraytekSession) -> None:
-        """Read one device's live rate from the router's Data Flow Monitor
-        (`show traffic <ip> tx/rx`) — one device per poll cycle so the SSH
-        session isn't held for seconds at a time. Rotation covers devices
-        with open NAT sessions, busiest first, capped at DFM_MAX_DEVICES.
-
-        Readings land in `live_rates` (the "now" display) and, when nonzero,
-        in db.live_samples — the fallback layer charts merge with NetFlow
-        data (per-bucket MAX, so NetFlow's exact figures win once the
-        flow-end record backfills)."""
-        if not self._dfm_rotation:
-            per_ip = self.sessions_by_ip()
-            self._dfm_rotation = sorted(per_ip, key=lambda ip: -per_ip[ip])[:DFM_MAX_DEVICES]
-            if not self._dfm_rotation:
-                return
-        ip = self._dfm_rotation.pop(0)
-        mac = db.mac_for_ip(ip)
-        if mac is None:
-            return  # not discovered yet — skip this slot, retry next pass
-        flows = await self.collector.flow([ip], session)
-        if not flows:
-            return
-        f = flows[0]
-        now = int(time.time())
-        self.live_rates[mac] = (f.tx_bps, f.rx_bps, now)
-        hist = self.live_history.setdefault(mac, deque(maxlen=2200))
-        hist.append((now, f.tx_bps, f.rx_bps))
-        self.dfm_last_ts = now
-        if f.tx_bps > 0 or f.rx_bps > 0:
-            bucket = now - (now % db.SAMPLE_BUCKET_S)
-            db.upsert_live_sample(mac, bucket, f.tx_bps, f.rx_bps)
-
-    def dfm_stats(self) -> dict:
-        """Diagnostics for the live-rate poller."""
-        return {
-            "tracked": len(self.live_rates),
-            "last_reading_ts": self.dfm_last_ts,
-            "rotation_pending": len(self._dfm_rotation),
-        }
 
     def lookup_portmap(self, pseudo_ip: str, pseudo_port: int) -> str | None:
         """Reverse-NAT lookup. Given the WAN-side IP+port from an inbound

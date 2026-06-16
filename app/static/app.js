@@ -190,11 +190,9 @@ function renderDeviceTable() {
       // Open NAT sessions but no fresh flow data: the router only exports a
       // long transfer when it finishes, so the rate is unknown — say so
       // instead of showing a false 0 bps.
-      const liveDot = d.rate_source === "live"
-        ? `<span class="dot-live" title="live reading from the router's Data Flow Monitor"></span>` : "";
       const rateCells = d.rate_pending
         ? `<td class="num" colspan="2"><span class="pending" title="${d.active_sessions} open NAT session(s) but no flow data — the router reports a long transfer only when it finishes">in progress…</span></td>`
-        : `<td class="num">${liveDot}<span class="rate">${fmtRate(d.tx_bps)}</span></td>
+        : `<td class="num"><span class="rate">${fmtRate(d.tx_bps)}</span></td>
            <td class="num"><span class="rate">${fmtRate(d.rx_bps)}</span></td>`;
       const barW = Math.round((vol24h(d) / maxVol) * 100);
       return `<tr data-mac="${escapeHtml(d.mac)}" class="${d.mac === selectedMac ? "active" : ""}">
@@ -427,8 +425,8 @@ function usageChartConfig(points, bucketS, sinceTs, hours) {
 
 async function refreshMainChart() {
   const hours = parseInt(document.getElementById("range").value, 10);
-  // Network-wide volume per bin: exact where NetFlow reported, live-estimated
-  // where only DFM readings exist. Per-device rate lines live in the modal.
+  // Network-wide volume per bin (exact byte totals). Per-device rate lines
+  // live in the modal.
   const bucketS = USAGE_BUCKET_S[hours] || 3600;
   const data = await fetchJSON(`/api/usage/total?hours=${hours}&bucket_s=${bucketS}`);
   const ctx = document.getElementById("main-chart").getContext("2d");

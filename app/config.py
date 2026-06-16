@@ -3,12 +3,11 @@ from typing import Literal
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-# LIVE-PATH SETTING. The `show traffic <ip>` Data Flow Monitor series is the
-# live per-device rate source (poller round-robin; NetFlow only reports a flow
-# when it ends), and this tells the parser how to read each integer in the
-# series — so a wrong unit scales every live rate and the volumes estimated
-# from them. Calibrate with /debug/ssh/raw-traffic?ip=<ip> against the
-# router's Data Flow Monitor web page. Known units:
+# DEBUG-ONLY. Per-device traffic comes from NetFlow; the `show traffic <ip>`
+# CLI path survives only in the /debug/ssh/* endpoints (raw-traffic, calibrate)
+# for cross-checking NetFlow against the router's Data Flow Monitor. This tells
+# those endpoints how to read each integer in the time-series — different
+# DrayTek firmwares emit different units:
 #   - 2762n (older firmware) — bytes-per-minute aggregate
 #   - 2765 series            — kilobits-per-second (raw 88064 → 88 Mbps)
 # Override per-deployment via the TRAFFIC_UNIT env var.

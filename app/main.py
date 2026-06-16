@@ -219,32 +219,13 @@ async def diagnostics() -> dict:
         checks.append(_check("nf_bytes", "Byte attribution", "info",
                              "no byte-carrying flow records yet"))
 
-    # --- Live rate poller (Data Flow Monitor over SSH) — the source that
-    # makes in-progress transfers visible before their flow record exports.
-    dfm = poller.dfm_stats()
-    if dfm["last_reading_ts"]:
-        dfm_age = now - dfm["last_reading_ts"]
-        checks.append(_check(
-            "dfm", "Live rate poller", "ok" if dfm_age < 60 else "warn",
-            f"{dfm['tracked']} devices with live readings, last reading {dfm_age}s ago "
-            f"(rotates through devices with open NAT sessions)",
-            None if dfm_age < 60 else
-            "No recent readings — the SSH poll loop may be failing (see Router link).",
-        ))
-    else:
-        checks.append(_check(
-            "dfm", "Live rate poller", "info",
-            "no live readings yet — starts as soon as a device has open NAT sessions",
-        ))
-
     # --- Database.
     try:
         counts = db.table_counts()
         checks.append(_check(
             "db", "Database", "ok",
             f"{counts['devices']} devices, {counts['samples']} flow samples, "
-            f"{counts['live_samples']} live samples, {counts['wan_samples']} WAN samples "
-            f"at {settings.db_path}",
+            f"{counts['wan_samples']} WAN samples at {settings.db_path}",
         ))
     except Exception as e:
         checks.append(_check("db", "Database", "fail", f"{type(e).__name__}: {e}"))
@@ -309,24 +290,17 @@ async def devices() -> list[dict]:
     for r in rows:
         if not r.get("vendor"):
             r["vendor"] = oui.lookup(r["mac"])
+        # rate_pending: open NAT sessions but no fresh sample bucket. NetFlow
+        # exports a flow only when it ends, so this device may be mid-transfer
+        # and unmeasured — the UI shows "in progress…" instead of a false
+        # 0 bps. Limits: NAT entries linger after close (false positive), and
+        # a long flow plus background chatter keeps buckets fresh, hiding the
+        # badge (false negative). An honest hint, not a meter.
         n = sessions.get(r.get("ip") or "", 0)
-        r["active_sessions"] = n
-        # "Now" rate, best source first:
-        #   live — a fresh Data Flow Monitor reading from the router. Works
-        #          mid-transfer, which NetFlow can't (flows export at end).
-        #   flow — latest NetFlow sample bucket is fresh.
-        #   idle — neither; with open NAT sessions the UI shows "pending"
-        #          (something may be moving that nothing has measured yet).
-        live = poller.live_rates.get(r["mac"])
         ls = r.get("last_sample")
-        if live is not None and now - live[2] <= db.CURRENT_STALE_S:
-            r["tx_bps"], r["rx_bps"] = live[0], live[1]
-            r["rate_source"] = "live"
-        elif ls is not None and now - ls <= db.CURRENT_STALE_S:
-            r["rate_source"] = "flow"
-        else:
-            r["rate_source"] = "idle"
-        r["rate_pending"] = n > 0 and r["rate_source"] == "idle"
+        fresh = ls is not None and now - ls <= db.CURRENT_STALE_S
+        r["active_sessions"] = n
+        r["rate_pending"] = n > 0 and not fresh
     return rows
 
 

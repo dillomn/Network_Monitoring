@@ -1,44 +1,49 @@
 # DrayTek Network Monitor
 
-Receives **IPFIX** (NetFlow v10 — what the Vigor 2765 actually exports; v9 is also accepted) for exact per-device byte accounting, polls the router over SSH for device discovery, live per-device rates, WAN totals and the NAT port-map, and serves a dashboard + historical graphs from a single Docker container on a Raspberry Pi.
+Receives **IPFIX** (NetFlow v10 — what the Vigor 2765 actually exports; v9 is also accepted) for exact per-device byte accounting, polls the router over SSH for device discovery, WAN totals and the NAT port-map, and serves a dashboard + historical graphs from a single Docker container on a Raspberry Pi.
 
 Built and tested against the **Vigor 2762n** and **Vigor 2765 series**.
 
 ## What it does
 
 - Listens on UDP/2055 for IPFIX / NetFlow v9 records and credits each flow's bytes to the LAN-side device — outbound by LAN source IP or the MAC carried in the record, inbound reverse-NATted via the router's port-map. IPv4 and IPv6 (v6 needs your delegated prefix in `LAN_PREFIXES`).
-- Polls the DrayTek over one persistent SSH session, every `POLL_INTERVAL` (1 s): `srv dhcp status` + `ip arp status` (device identity), `show statistic` (per-WAN lifetime counters), `show portmap` (NAT table, every 5th cycle), and **one live Data Flow Monitor reading** (`show traffic <ip>`, round-robin over devices with open NAT sessions) — the live rate source.
+- Polls the DrayTek over one persistent SSH session, every `POLL_INTERVAL` (1 s): `srv dhcp status` + `ip arp status` (device identity), `show statistic` (per-WAN lifetime counters → live WAN bps via deltas), and `show portmap` (NAT table, every 5th cycle). SSH does **not** measure per-device traffic — NetFlow owns that.
 - Stores samples in SQLite (default 30-day retention).
-- Web UI at `http://<pi-ip>:8090`: summary tiles (network rate now, 24 h volume, devices online, top consumer), a device list led by **transfer volumes** (1 h / 24 h) with live rates (green dot = live router reading) and an **"in progress…"** badge for devices with open sessions but no measurements yet, a network-wide usage chart, and per-device volume + rate charts that line up on a shared time axis with the trailing ~2 minutes shaded ("data still arriving").
-- **Settings ⚙** (header gear) runs live diagnostics — router link, IPFIX ingest, byte attribution, live rate poller, DB — backed by `/api/diagnostics`.
+- Web UI at `http://<pi-ip>:8090`: summary tiles (network rate now, 24 h volume, devices online, top consumer), a device list led by **transfer volumes** (1 h / 24 h) with current rates and an **"in progress…"** badge for devices with open NAT sessions but no measurements yet, a network-wide usage chart, and per-device volume + rate charts that line up on a shared time axis with the trailing ~2 minutes shaded ("data still arriving").
+- **Settings ⚙** (header gear) runs live diagnostics — router link, IPFIX ingest, byte attribution, DB — backed by `/api/diagnostics`.
 
-> **Data sources at a glance:** two complementary per-device sources. **IPFIX** is the
-> accounting source — exact byte counts, but this firmware only exports a flow when it
-> *ends*. The **Data Flow Monitor** (`show traffic <ip>` over SSH) is the live source —
-> it sees a transfer *while it runs*, including flows the exporter never reports.
-> Charts merge them per 10 s bucket by MAX: live estimates fill the gaps, exact flow
-> figures win once they arrive.
+> **Data source:** per-device traffic comes **only** from IPFIX/NetFlow. SSH supplies
+> device identity (DHCP/ARP), WAN totals (`show statistic`), and the NAT port-map — it
+> does **not** measure per-device traffic. The `show traffic <ip>` CLI path survives
+> solely in the `/debug/ssh/*` endpoints for cross-checking.
 
 ### Reading the numbers
 
 This firmware ignores the Active Timeout for ongoing flows — a flow's **total bytes + start/end time arrive only when it ends**. How the app deals with that:
 
-- **Volumes (1h/24h columns, the bar charts) are exact where flow records landed** and
-  live-estimated where only Data Flow Monitor readings exist (a transfer still in
-  progress, or a flow the exporter never sent).
-- **Rate lines follow the measured shape where possible**: a flow-end record's bytes are
-  distributed across its span *proportionally to the Data Flow Monitor readings* taken
-  while it ran — a download that ran 100 Mbps then 5 Mbps charts as exactly that. The
-  flow record anchors the exact total (weights are normalised, so a miscalibrated
-  `TRAFFIC_UNIT` only affects shape, never magnitude). Without covering readings it
-  falls back to a flat average. `flows_spread_shaped` vs `flows_spread_uniform` in
-  `/api/netflow/stats` shows which path flows take.
-- **Long transfers are visible live** via the Data Flow Monitor readings; when the flow
-  record finally exports, its exact figures replace the estimates. A wrong
-  `TRAFFIC_UNIT` scales every live reading — calibrate via `/debug/ssh/raw-traffic?ip=<ip>`.
+- **Volumes (1h/24h columns, the bar charts) are exact** — they sum to what the flow
+  records reported.
+- **Rate lines are estimates of shape**: a flow-end record's bytes are spread *uniformly*
+  across the flow's span, so a long download that ran fast-then-slow draws as a flat
+  average. The byte total is exact; only the shape within a single flow is assumed.
+  Short flows (most traffic, expired ≤15 s after going idle) are nearly true-to-shape.
+- **A long transfer is not visible until it finishes** — it then backfills the charts at
+  the right place and average rate. The **"in progress…"** badge (open NAT sessions, no
+  fresh samples) is the only live hint that a device is doing something unmeasured. If
+  you need *live* visibility of in-progress transfers, that requires a second data source
+  (sFlow) — see *Limitations* below.
 - **If a known download never showed up at all**, open Settings → *Byte attribution*: the
   bytes landed somewhere, and that row says which guard dropped them. A large
   `both_public` share usually means IPv6 — add your delegated prefix to `LAN_PREFIXES`.
+
+## Limitations
+
+- **No live view of in-progress transfers.** Because the firmware only exports a flow when
+  it ends, a download or video stream that runs for minutes (or indefinitely) shows nothing
+  until it completes, then appears retroactively. The "in progress…" badge flags that a
+  device is active, but gives no rate or volume until the flow finishes. Getting a true live
+  rate would mean adding **sFlow** (a separate, continuously-sampled export the Vigor 2765
+  supports from firmware 4.4.0+) as a second source — not currently implemented.
 
 ## Prerequisites
 
@@ -55,8 +60,7 @@ This firmware ignores the Active Timeout for ongoing flows — a flow's **total 
    - **Collector IP** = the Pi's LAN IP
    - **Collector Port** = `2055`
    - **Version** = `IPFIX` (the 2765 exports IPFIX with absolute flow timestamps, which the collector prefers; `v9` also works — older models like the 2762n only offer v9)
-   - **Active Timeout** = `60` s (the minimum — though this firmware doesn't actually chop ongoing flows; live visibility comes from the Data Flow Monitor poller instead)
-   - **Inactive Timeout** = `15` s (the minimum; lower = finished flows are reported sooner)
+   - **Active Timeout** = `60` s and **Inactive Timeout** = `15` s (both the minimum; lower inactive = finished flows are reported sooner)
    - Click **OK**.
 3. *(Recommended)* Create a dedicated read-only SSH user under *System Maintenance → Administrator Password / Management Account*. SSH key auth is not supported on Vigors — password only.
 
@@ -78,7 +82,7 @@ Open **Settings ⚙** in the UI — every check should be green within a minute 
 curl http://<pi-ip>:8090/api/netflow/stats
 ```
 
-Healthy looks like: `packets_received` climbing, `records_processed > 0`, `last_packet_age_s` under ~30 s, and most bytes under `reason_bytes.outbound`/`inbound`. After a real download, `flows_spread_shaped` should increment (the rate chart used measured shape, not a flat average). If `packets_received` stays at 0, the router isn't reaching the collector — usually a firewall on the Pi (`sudo ufw status`) or a wrong Collector IP; `sudo tcpdump -nni any udp port 2055` shows whether packets arrive at all.
+Healthy looks like: `packets_received` climbing, `records_processed > 0`, `last_packet_age_s` under ~30 s, and most bytes under `reason_bytes.outbound`/`inbound`. If `packets_received` stays at 0, the router isn't reaching the collector — usually a firewall on the Pi (`sudo ufw status`) or a wrong Collector IP; `sudo tcpdump -nni any udp port 2055` shows whether packets arrive at all.
 
 ## Testing without a router
 
@@ -101,11 +105,11 @@ The device list and graphs fill in within a few seconds. Drop `--db` to send flo
 | `ROUTER_SSH_PORT` | `22` | SSH port |
 | `ROUTER_SSH_USER` | `admin` | SSH username |
 | `ROUTER_SSH_PASSWORD` | *(required)* | SSH password. Wrap in single quotes if it contains `$`, `#`, or `!` |
-| `POLL_INTERVAL` | `1` | Seconds between SSH poll cycles (discovery, WAN totals, port-map, one live rate reading) |
+| `POLL_INTERVAL` | `1` | Seconds between SSH poll cycles (discovery, WAN totals, port-map) |
 | `RETENTION_DAYS` | `30` | Days of history to keep |
 | `NETFLOW_PORT` | `2055` | UDP port the flow collector binds. Must match the router's *Collector Port* |
 | `LAN_PREFIXES` | RFC1918 + IPv6 ULA + link-local | Comma-separated CIDRs treated as LAN. **Add your delegated IPv6 prefix** or v6 traffic lands in `both_public` |
-| `TRAFFIC_UNIT` | `kilobits_per_second` | Unit of the router's `show traffic` series — scales every live rate reading. Correct for the 2765; calibrate other models via `/debug/ssh/raw-traffic?ip=<ip>` |
+| `TRAFFIC_UNIT` | `kilobits_per_second` | *Debug-only.* Unit of the router's `show traffic` series for the `/debug/ssh/raw-traffic` cross-check. Not on the live data path |
 
 ## Troubleshooting
 
@@ -137,5 +141,5 @@ DrayTek-side behaviour the code depends on:
 
 - [RFC 7011 — IPFIX Protocol Specification](https://datatracker.ietf.org/doc/html/rfc7011) — the wire format the Vigor 2765 exports (NetFlow v10), including the absolute flow timestamps (IEs 150–153) the collector prefers.
 - [RFC 3954 — Cisco NetFlow Services Export Version 9](https://datatracker.ietf.org/doc/html/rfc3954) — the v9 format, also parsed (older Vigors, and the bundled simulator).
-- [DrayTek — How do I use the Data Flow Monitor?](https://www.draytek.co.uk/support/guides/kb-vigor-dataflowmonitor) — the per-IP rate readout behind the live overlay; the web UI displays kbps, matching `TRAFFIC_UNIT`.
+- [DrayTek — How do I use the Data Flow Monitor?](https://www.draytek.co.uk/support/guides/kb-vigor-dataflowmonitor) — the per-IP rate readout used by the `/debug/ssh/*` cross-check; the web UI displays kbps, matching `TRAFFIC_UNIT`.
 - [DrayTek Telnet Commands for DrayOS Routers (PDF, v1.4)](https://www.i-lan.net.au/dfaq/DrayTek/misc/DrayTek_Telnet%20Commands%20V1.4.pdf) — CLI reference for `srv dhcp status`, `ip arp status`, `sys version`, `show statistic`.

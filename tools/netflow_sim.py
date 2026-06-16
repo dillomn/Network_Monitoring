@@ -210,14 +210,10 @@ def _cleanup_devices(db_path: str) -> None:
     try:
         c = sqlite3.connect(db_path)
         n_s = c.execute(f"DELETE FROM samples WHERE mac IN ({placeholders})", macs).rowcount
-        try:
-            n_l = c.execute(f"DELETE FROM live_samples WHERE mac IN ({placeholders})", macs).rowcount
-        except sqlite3.OperationalError:
-            n_l = 0  # table only exists once the current app version has run
         n_d = c.execute(f"DELETE FROM devices WHERE mac IN ({placeholders})", macs).rowcount
         c.commit()
         c.close()
-        print(f"removed {n_d} simulated devices, {n_s} samples and {n_l} live samples from {db_path}")
+        print(f"removed {n_d} simulated devices and {n_s} samples from {db_path}")
     except sqlite3.OperationalError as e:
         print(f"WARN: cleanup failed ({e})")
 

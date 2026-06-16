@@ -65,10 +65,7 @@ def _lan_record(out_bytes: int = 0, in_bytes: int = 0,
     )
 
 
-class _CollectorTestBase(unittest.TestCase):
-    """Shared fixture: fake clock, captured add_samples, fresh collector.
-    No test methods of its own — subclasses add them."""
-
+class SpreadTest(unittest.TestCase):
     def setUp(self) -> None:
         self.clock = FakeClock()
         self._real_time = nf.time
@@ -88,8 +85,6 @@ class _CollectorTestBase(unittest.TestCase):
         """rate values written, by bucket ts -> rx_bps (after _flush)."""
         return {ts: rx for (_mac, ts, _tx, rx) in self.rows}
 
-
-class SpreadTest(_CollectorTestBase):
     def test_long_download_is_spread_not_spiked(self) -> None:
         # 1.586 GB downloaded over 283 s, exported as ONE record at flow end.
         total = 1_586_000_000
@@ -146,68 +141,6 @@ class SpreadTest(_CollectorTestBase):
         self.c._flush()
         self.assertEqual(self.rows, [])
         self.assertEqual(self.c._pending, {})  # cleared, can't grow unbounded
-
-
-class ProfiledSpreadTest(_CollectorTestBase):
-    """When the poller's Data Flow Monitor history covers a flow's window, the
-    collector must distribute the flow's bytes proportionally to the MEASURED
-    rates — not uniformly. The flow record still anchors the exact total."""
-
-    def setUp(self) -> None:
-        super().setUp()
-        from collections import deque
-        from app import poller as poller_module
-        self._poller = poller_module.poller
-        self.flow_start = ARRIVAL_TS - 120
-        # Readings every 10 s: first minute ~100 Mbps down, second ~5 Mbps.
-        readings = []
-        for k in range(1, 13):
-            ts = self.flow_start + 10 * k
-            rx = 100e6 if k <= 6 else 5e6
-            readings.append((ts, 0.0, rx))
-        self._poller.live_history[LAN_MAC] = deque(readings)
-
-    def tearDown(self) -> None:
-        self._poller.live_history.clear()
-        super().tearDown()
-
-    def test_spread_follows_measured_profile(self) -> None:
-        # 787.5 MB over 120 s = the integral of the profile above.
-        total = 787_500_000
-        self.c._attribute(_lan_record(
-            out_bytes=total, flow_start_ms=1_000_000, flow_end_ms=1_000_000 + 120_000,
-        ))
-        self.c._flush()
-        rx = self._rx_at()
-
-        # Conservation: the measured shape redistributes, never resizes.
-        bytes_back = sum(v * self.bucket / 8 for v in rx.values())
-        self.assertAlmostEqual(bytes_back, total, delta=total * 0.001)
-
-        # Shape: an early bucket reads near 100 Mbps, a late one near 5 Mbps —
-        # NOT the flat ~52.5 Mbps average the uniform fallback would produce.
-        early = rx.get(nf._bucket(self.flow_start + 30), 0.0)
-        late = rx.get(nf._bucket(self.flow_start + 100), 0.0)
-        self.assertGreater(early, 60_000_000)
-        self.assertLess(late, 25_000_000)
-        self.assertEqual(self.c.flows_spread_shaped, 1)
-        self.assertEqual(self.c.flows_spread_uniform, 0)
-
-    def test_uniform_fallback_without_readings(self) -> None:
-        self._poller.live_history.clear()
-        total = 120_000_000
-        self.c._attribute(_lan_record(
-            out_bytes=total, flow_start_ms=1_000_000, flow_end_ms=1_000_000 + 120_000,
-        ))
-        self.c._flush()
-        rx = self._rx_at()
-        bytes_back = sum(v * self.bucket / 8 for v in rx.values())
-        self.assertAlmostEqual(bytes_back, total, delta=total * 0.001)
-        # Flat: every interior bucket carries the same average rate.
-        interior = [v for ts, v in rx.items()
-                    if self.flow_start + self.bucket <= ts <= ARRIVAL_TS - 2 * self.bucket]
-        self.assertTrue(all(abs(v - interior[0]) < 1.0 for v in interior))
-        self.assertEqual(self.c.flows_spread_uniform, 1)
 
 
 class UpsertAddTest(unittest.TestCase):
@@ -288,66 +221,16 @@ class VolumeTest(unittest.TestCase):
         self.assertEqual(d["vol_tx_24h"], 0.0)
         self.assertEqual(d["vol_rx_24h"], 0.0)
 
-
-class LiveMergeTest(unittest.TestCase):
-    """live_samples (Data Flow Monitor readings) merge with NetFlow samples by
-    per-bucket MAX: live estimates fill buckets NetFlow hasn't reported yet (a
-    transfer in progress, or a flow the exporter never sent), and NetFlow's
-    larger exact figures win once the flow-end record backfills."""
-
-    def setUp(self) -> None:
-        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        self.tmp.close()
-        self._real_path = db.settings.db_path
-        db.settings.db_path = self.tmp.name
-        db.init_db()
-
-    def tearDown(self) -> None:
-        db.settings.db_path = self._real_path
-        os.unlink(self.tmp.name)
-
-    def test_live_fills_gaps_and_larger_netflow_wins(self) -> None:
-        db.add_samples([("AA", 1000, 100.0, 1000.0)])   # NetFlow bucket
-        db.upsert_live_sample("AA", 1000, 40.0, 400.0)  # overlapped → NetFlow wins (MAX)
-        db.upsert_live_sample("AA", 1010, 40.0, 400.0)  # live-only bucket survives
-        pts = {p["ts"]: (p["tx_bps"], p["rx_bps"]) for p in db.history_for("AA", 0)}
-        self.assertEqual(pts[1000], (100.0, 1000.0))
-        self.assertEqual(pts[1010], (40.0, 400.0))
-
-    def test_live_estimate_beats_smaller_netflow_chatter(self) -> None:
-        # Mid-download: NetFlow only has the device's background chatter for
-        # this bucket; the DFM reading carries the real rate. MAX keeps it.
-        db.add_samples([("AA", 1000, 0.0, 5000.0)])           # 5 Kbps chatter
-        db.upsert_live_sample("AA", 1000, 0.0, 35_000_000.0)  # 35 Mbps download
-        pts = db.history_for("AA", 0)
-        self.assertEqual(pts[0]["rx_bps"], 35_000_000.0)
-
-    def test_live_reading_replaced_within_bucket(self) -> None:
-        db.upsert_live_sample("AA", 1000, 10.0, 10.0)
-        db.upsert_live_sample("AA", 1000, 70.0, 80.0)  # newer reading supersedes
-        pts = db.history_for("AA", 0)
-        self.assertEqual(len(pts), 1)
-        self.assertEqual((pts[0]["tx_bps"], pts[0]["rx_bps"]), (70.0, 80.0))
-
-    def test_usage_total_sums_devices_and_sources(self) -> None:
+    def test_usage_total_sums_all_devices(self) -> None:
         b = db.SAMPLE_BUCKET_S
         db.add_samples([("AA", 3600, 80.0, 0.0)])
-        db.add_samples([("BB", 3600 + b, 80.0, 0.0)])
-        db.upsert_live_sample("CC", 3600, 80.0, 0.0)
+        db.add_samples([("BB", 3600 + b, 80.0, 0.0)])  # same hour bin, other device
+        db.add_samples([("AA", 7200, 80.0, 0.0)])      # next hour bin
         pts = db.usage_total(0, 3600)
-        self.assertEqual(len(pts), 1)
-        self.assertEqual(pts[0]["ts"], 3600)
-        self.assertAlmostEqual(pts[0]["tx_bytes"], 3 * 80.0 * b / 8)
-
-    def test_volumes_include_live_only_buckets(self) -> None:
-        b = db.SAMPLE_BUCKET_S
-        db.upsert_device("AA", "192.168.1.10", "thing")
-        now = int(time.time())
-        bucket = now - (now % b) - 60
-        db.upsert_live_sample("AA", bucket, 0.0, 8.0)  # live-only: b bytes RX
-        d = {r["mac"]: r for r in db.list_devices_with_current()}["AA"]
-        self.assertAlmostEqual(d["vol_rx_1h"], 8.0 * b / 8)
-        self.assertAlmostEqual(d["vol_rx_24h"], 8.0 * b / 8)
+        by = {p["ts"]: p["tx_bytes"] for p in pts}
+        self.assertEqual(set(by), {3600, 7200})
+        self.assertAlmostEqual(by[3600], 2 * 80.0 * b / 8)  # AA + BB
+        self.assertAlmostEqual(by[7200], 80.0 * b / 8)
 
 
 if __name__ == "__main__":
